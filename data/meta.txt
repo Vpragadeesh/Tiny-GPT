@@ -1,0 +1,6 @@
+dataset      : fineweb
+tokeniser    : gpt2
+vocab_size   : 50257
+train_tokens : 9753076758
+val_tokens : 100388902
+test_tokens : 100523684
