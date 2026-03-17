@@ -1,6 +1,6 @@
 *.bin
 *.pt
-./nvme_offload/
-./__pycache__/
-./.ruff_cache/
-./checkpoints/
+nvme_offload/
+__pycache__/
+.ruff_cache/
+checkpoints/
