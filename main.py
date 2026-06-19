@@ -80,7 +80,7 @@ print()
 # 3. HYPERPARAMETERS
 # ═════════════════════════════════════════════════════════════════════════════
 
-BLOCK_SIZE    = 128              # context window (tokens)
+BLOCK_SIZE    = 512              # context window (tokens)
 MICRO_BATCH   = 2                # samples per GPU forward pass (tiny for VRAM)
 GRAD_ACCUM    = 8                # accumulate before optimizer step → eff. batch 16
 EMBED_DIM     = 768              # model width
@@ -92,8 +92,8 @@ FFN_DIM       = EMBED_DIM * 4   # 3 072  (expert hidden dim)
 DROPOUT       = 0.1
 LR            = 1.5e-4           # peak learning rate (reduced from 3e-4 to prevent NaN)
 WARMUP_STEPS  = 500              # increased warmup for stability
-MAX_ITERS     = 10000            # extended training to 10k steps
-EVAL_EVERY    = 500
+MAX_ITERS     = 100_000           # extended training to 100k steps
+EVAL_EVERY    = 2_000
 EVAL_ITERS    = 50
 AUX_LOSS_W    = 0.01             # load-balancing auxiliary loss weight
 GRAD_CLIP     = 1.0
@@ -288,7 +288,7 @@ class MoEGPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, prompt: str, max_new_tokens=200, temperature=0.8):
+    def generate(self, prompt: str, max_new_tokens=200, temperature=0.8, top_k=50, top_p=0.9):
         self.eval()
         ids = encode(prompt)
         idx = torch.tensor([ids], dtype=torch.long, device=DEVICE)
@@ -297,6 +297,21 @@ class MoEGPT(nn.Module):
             ctx = idx[:, -BLOCK_SIZE:]
             logits, _ = self(ctx)
             logits = logits[:, -1, :].float() / temperature
+            
+            # Top-K filtering
+            if top_k is not None:
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                logits[indices_to_remove] = float("-inf")
+            
+            # Top-P (nucleus) filtering
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumsum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumsum_probs > top_p
+                sorted_indices_to_remove[..., 0] = False
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                logits[:, indices_to_remove] = float("-inf")
+            
             probs  = F.softmax(logits, dim=-1)
             nxt    = torch.multinomial(probs, 1)
             idx    = torch.cat([idx, nxt], dim=1)

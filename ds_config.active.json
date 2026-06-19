@@ -1,7 +1,7 @@
 {
-  "train_batch_size": 16,
-  "train_micro_batch_size_per_gpu": 2,
-  "gradient_accumulation_steps": 8,
+  "train_batch_size": 4,
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": 4,
   "optimizer": {
     "type": "AdamW",
     "params": {
@@ -15,23 +15,15 @@
       "torch_adam": true
     }
   },
-  "scheduler": {
-    "type": "WarmupLR",
-    "params": {
-      "warmup_min_lr": 0,
-      "warmup_max_lr": 0.00015,
-      "warmup_num_steps": 500
-    }
-  },
   "zero_optimization": {
     "stage": 2,
     "offload_optimizer": {
       "device": "cpu",
-      "pin_memory": true
+      "pin_memory": false
     },
     "overlap_comm": true,
     "contiguous_gradients": true,
-    "reduce_bucket_size": 2000000.0,
+    "reduce_bucket_size": 1000000.0,
     "gather_16bit_weights_on_model_save": false
   },
   "bf16": {
@@ -43,7 +35,7 @@
     "contiguous_memory_optimization": true,
     "number_checkpoints": 12,
     "synchronize_checkpoint_boundary": false,
-    "cpu_checkpointing": false
+    "cpu_checkpointing": true
   },
   "wall_clock_breakdown": false,
   "steps_per_print": 100,

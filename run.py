@@ -14,24 +14,25 @@ No training — just inference from the best checkpoint.
 import os
 import sys
 import argparse
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import tiktoken
-from pathlib import Path
 
 # ═════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION (must match main.py)
 # ═════════════════════════════════════════════════════════════════════════════
 
-BLOCK_SIZE = 128
+BLOCK_SIZE = 512
 EMBED_DIM = 768
 NUM_HEADS = 12
 NUM_LAYERS = 12
 NUM_EXPERTS = 8
 TOP_K = 2
 FFN_DIM = EMBED_DIM * 4
-DROPOUT = 0.1
+DROPOUT = 0.0
 CHECKPOINT_DIR = "checkpoints"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -92,6 +93,46 @@ def apply_model_config_from_state_dict(state_dict: dict):
         FFN_DIM = EMBED_DIM * 4
 
     NUM_HEADS = _infer_num_heads(EMBED_DIM)
+
+
+def _get_model_state_from_checkpoint(ckpt: dict) -> dict:
+    """Support both training checkpoint formats used in this repo."""
+    if "model_state" in ckpt:
+        return ckpt["model_state"]
+    if "model" in ckpt:
+        return ckpt["model"]
+    raise KeyError("Checkpoint does not contain 'model_state' or 'model'")
+
+
+def resolve_checkpoint_path(
+    checkpoint_path=None,
+    hf_repo=None,
+    hf_filename="best.pt",
+    hf_revision=None,
+    hf_token=None,
+):
+    """Resolve a local checkpoint path, optionally downloading from HF Hub."""
+    if hf_repo:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            print("[ERROR] huggingface_hub is required for --hf-repo")
+            print("[ERROR] Install it with: pip install huggingface_hub")
+            sys.exit(1)
+
+        cache_dir = Path("hf_cache") / "hub"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return hf_hub_download(
+            repo_id=hf_repo,
+            filename=hf_filename,
+            revision=hf_revision,
+            token=hf_token,
+            cache_dir=str(cache_dir),
+        )
+
+    if checkpoint_path is None:
+        checkpoint_path = os.path.join(CHECKPOINT_DIR, "best.pt")
+    return checkpoint_path
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -283,10 +324,21 @@ class MoEGPT(nn.Module):
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def load_model(checkpoint_path=None):
+def load_model(
+    checkpoint_path=None,
+    hf_repo=None,
+    hf_filename="best.pt",
+    hf_revision=None,
+    hf_token=None,
+):
     """Load the trained model from checkpoint."""
-    if checkpoint_path is None:
-        checkpoint_path = os.path.join(CHECKPOINT_DIR, "best.pt")
+    checkpoint_path = resolve_checkpoint_path(
+        checkpoint_path=checkpoint_path,
+        hf_repo=hf_repo,
+        hf_filename=hf_filename,
+        hf_revision=hf_revision,
+        hf_token=hf_token,
+    )
 
     if not os.path.exists(checkpoint_path):
         print(f"[ERROR] Checkpoint not found at: {checkpoint_path}")
@@ -295,11 +347,12 @@ def load_model(checkpoint_path=None):
 
     print(f"Loading model from {checkpoint_path} ...", end=" ", flush=True)
     ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
-    apply_model_config_from_state_dict(ckpt["model_state"])
+    model_state = _get_model_state_from_checkpoint(ckpt)
+    apply_model_config_from_state_dict(model_state)
 
     model = MoEGPT()
     model = model.to(dtype=DTYPE, device=DEVICE)
-    model.load_state_dict(ckpt["model_state"])
+    model.load_state_dict(model_state)
     model.eval()
 
     print("✓")
@@ -333,6 +386,7 @@ def interactive_mode(model):
     print("  /topp 0.9     – Set top-p (default 0.9)")
     print()
 
+    model.eval()
     temperature = 0.8
     max_tokens = 200
     top_k = None
@@ -384,6 +438,7 @@ def interactive_mode(model):
         print(output)
         print()
 
+    model.train()
     print("\nGoodbye!")
 
 
@@ -420,6 +475,7 @@ Examples:
   python run.py --prompt "Hello world"   # Generate from prompt
   python run.py --prompts file.txt       # Batch from file (one per line)
   python run.py --checkpoint custom.pt   # Use custom checkpoint
+    python run.py --hf-repo user/Tiny-GPT  # Load from Hugging Face Hub
         """,
     )
     parser.add_argument(
@@ -437,6 +493,30 @@ Examples:
         type=str,
         default=None,
         help="Path to checkpoint (default: checkpoints/best.pt)",
+    )
+    parser.add_argument(
+        "--hf-repo",
+        type=str,
+        default=None,
+        help="Hugging Face repo id (e.g. user/Tiny-GPT). If set, download checkpoint from HF Hub.",
+    )
+    parser.add_argument(
+        "--hf-filename",
+        type=str,
+        default="best.pt",
+        help="Filename inside HF repo (default: best.pt)",
+    )
+    parser.add_argument(
+        "--hf-revision",
+        type=str,
+        default=None,
+        help="HF branch/tag/commit to download from",
+    )
+    parser.add_argument(
+        "--hf-token",
+        type=str,
+        default=None,
+        help="HF token for private repos (or use HF_TOKEN env var)",
     )
     parser.add_argument(
         "--max-tokens",
@@ -465,13 +545,26 @@ Examples:
 
     args = parser.parse_args()
 
+    if args.hf_repo and args.checkpoint:
+        print("[ERROR] Use either --checkpoint or --hf-repo, not both.")
+        sys.exit(1)
+
+    hf_token = args.hf_token or os.environ.get("HF_TOKEN")
+
     # Load model
-    model = load_model(args.checkpoint)
+    model = load_model(
+        checkpoint_path=args.checkpoint,
+        hf_repo=args.hf_repo,
+        hf_filename=args.hf_filename,
+        hf_revision=args.hf_revision,
+        hf_token=hf_token,
+    )
 
     # Dispatch to appropriate mode
     if args.prompt:
         # Single prompt
         print(f"Prompt: {args.prompt}\n")
+        model.eval()
         with torch.no_grad():
             output = model.generate(
                 args.prompt,
@@ -480,6 +573,7 @@ Examples:
                 top_k=args.top_k,
                 top_p=args.top_p,
             )
+        model.train()
         print(output)
 
     elif args.prompts:

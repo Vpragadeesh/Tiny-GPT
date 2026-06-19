@@ -43,6 +43,29 @@ Training progress shows in real-time via rich progress bar.
 python run.py
 ```
 
+## 🤗 Use Hugging Face Hub (instead of local/GitHub checkpoints)
+
+### 1. Upload checkpoints to HF Hub
+```bash
+pip install huggingface_hub
+export HF_TOKEN=your_hf_token
+python push_to_hf.py --repo-id yourname/Tiny-GPT
+```
+
+This uploads:
+- `checkpoints/best.pt` → `best.pt`
+- `checkpoints/latest.pt` → `latest.pt` (if present)
+
+### 2. Run inference directly from HF Hub
+```bash
+python run.py --hf-repo yourname/Tiny-GPT --prompt "The future of AI is"
+```
+
+Optional flags:
+- `--hf-filename best.pt`
+- `--hf-revision main`
+- `--hf-token <token>` (or use `HF_TOKEN` env var)
+
 ## 📁 File Structure
 
 ```

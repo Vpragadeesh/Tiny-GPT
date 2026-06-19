@@ -86,8 +86,8 @@ print()
 # ═════════════════════════════════════════════════════════════════════════════
 
 BLOCK_SIZE    = 64               # context window (tokens)
-MICRO_BATCH   = 2                # samples per GPU forward pass (managed by DeepSpeed)
-GRAD_ACCUM    = 8                # accumulate before optimizer step → eff. batch 16
+MICRO_BATCH   = 8                # samples per GPU forward pass (managed by DeepSpeed)
+GRAD_ACCUM    = 4                # accumulate before optimizer step → eff. batch 16
 EMBED_DIM     = 512              # model width
 NUM_HEADS     = 8                # attention heads
 NUM_LAYERS    = 8                # transformer blocks
@@ -97,8 +97,8 @@ FFN_DIM       = EMBED_DIM * 4   # 2 048  (expert hidden dim)
 DROPOUT       = 0.1
 LR            = 1.5e-4           # peak learning rate
 WARMUP_STEPS  = 500              # linear warmup
-MAX_ITERS     = 30000            # total optimiser steps
-EVAL_EVERY    = 100
+MAX_ITERS     = 120_000           # total optimiser steps
+EVAL_EVERY    = 2_000
 EVAL_ITERS    = 50
 AUX_LOSS_W    = 0.01             # load-balancing auxiliary loss weight
 GRAD_CLIP     = 1.0
@@ -107,9 +107,23 @@ CHECKPOINT_DIR = "checkpoints"   # directory for saving checkpoints
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE  = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
+ALLOW_TF32 = os.environ.get("ALLOW_TF32", "1") == "1"
+USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "0") == "1"
+USE_ACTIVATION_CHECKPOINT = os.environ.get("USE_ACTIVATION_CHECKPOINT", "1") == "1"
+
+if DEVICE == "cuda":
+    # Throughput-oriented CUDA settings.
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = ALLOW_TF32
+    torch.backends.cudnn.allow_tf32 = ALLOW_TF32
+    torch.set_float32_matmul_precision("high")
+
 print(f"Device          : {DEVICE.upper()}")
 print(f"Precision       : {'BF16 (DeepSpeed)' if DTYPE == torch.bfloat16 else 'FP32'}")
 print(f"Effective batch (default) : {MICRO_BATCH * GRAD_ACCUM}")
+print(f"TF32            : {'ON' if (DEVICE == 'cuda' and ALLOW_TF32) else 'OFF'}")
+print(f"Torch compile   : {'ON' if USE_TORCH_COMPILE else 'OFF'}")
+print(f"Act checkpoint  : {'ON' if USE_ACTIVATION_CHECKPOINT else 'OFF'}")
 print()
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -276,7 +290,7 @@ class MoEGPT(nn.Module):
 
         total_aux = 0.0
         for block in self.blocks:
-            if self.training:
+            if self.training and USE_ACTIVATION_CHECKPOINT:
                 x, aux = grad_checkpoint(block, x, use_reentrant=False)
             else:
                 x, aux = block(x)
@@ -291,7 +305,7 @@ class MoEGPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, prompt: str, max_new_tokens=200, temperature=0.8):
+    def generate(self, prompt: str, max_new_tokens=200, temperature=0.8, top_k=50, top_p=0.9):
         self.eval()
         ids = encode(prompt)
         idx = torch.tensor([ids], dtype=torch.long, device=DEVICE)
@@ -300,6 +314,21 @@ class MoEGPT(nn.Module):
             ctx = idx[:, -BLOCK_SIZE:]
             logits, _ = self(ctx)
             logits = logits[:, -1, :].float() / temperature
+
+            # Top-K filtering
+            if top_k is not None:
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                logits[indices_to_remove] = float("-inf")
+
+            # Top-P (nucleus) filtering
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumsum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumsum_probs > top_p
+                sorted_indices_to_remove[..., 0] = False
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                logits[:, indices_to_remove] = float("-inf")
+
             probs  = F.softmax(logits, dim=-1)
             nxt    = torch.multinomial(probs, 1)
             idx    = torch.cat([idx, nxt], dim=1)
@@ -313,14 +342,56 @@ class MoEGPT(nn.Module):
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
+
+def _strip_orig_mod_prefix(state_dict):
+    out = {}
+    for k, v in state_dict.items():
+        if k.startswith("_orig_mod."):
+            out[k[len("_orig_mod."):]] = v
+        else:
+            out[k] = v
+    return out
+
+
+def _add_orig_mod_prefix(state_dict):
+    out = {}
+    for k, v in state_dict.items():
+        if k.startswith("_orig_mod."):
+            out[k] = v
+        else:
+            out[f"_orig_mod.{k}"] = v
+    return out
+
+
+def _align_state_dict_for_model(state_dict, model):
+    """Align checkpoint keys with model keys (compiled vs non-compiled)."""
+    model_keys = list(model.state_dict().keys())
+    if not model_keys:
+        return state_dict
+
+    model_has_orig = model_keys[0].startswith("_orig_mod.")
+    ckpt_keys = list(state_dict.keys())
+    ckpt_has_orig = bool(ckpt_keys) and ckpt_keys[0].startswith("_orig_mod.")
+
+    if model_has_orig and not ckpt_has_orig:
+        return _add_orig_mod_prefix(state_dict)
+    if not model_has_orig and ckpt_has_orig:
+        return _strip_orig_mod_prefix(state_dict)
+    return state_dict
+
 def save_checkpoint(step, model, train_loss, val_loss, path):
     """Save model and training state to disk."""
     # DeepSpeed handles checkpointing, but we also save basic metadata
+    model_state = model.state_dict() if hasattr(model, "state_dict") else None
+    if model_state is not None:
+        # Store canonical keys so checkpoints are reusable across compile modes.
+        model_state = _strip_orig_mod_prefix(model_state)
+
     checkpoint = {
         "step": step,
         "train_loss": train_loss,
         "val_loss": val_loss,
-        "model_state": model.state_dict() if hasattr(model, 'state_dict') else None,
+        "model_state": model_state,
     }
     torch.save(checkpoint, path)
 
@@ -328,7 +399,8 @@ def load_checkpoint(path, model):
     """Load checkpoint and return the step to resume from."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if ckpt.get("model_state"):
-        model.load_state_dict(ckpt["model_state"])
+        model_state = _align_state_dict_for_model(ckpt["model_state"], model)
+        model.load_state_dict(model_state)
     print(f"  Resumed from step {ckpt['step']}  "
           f"(train {ckpt['train_loss']:.4f}, val {ckpt['val_loss']:.4f})")
     return ckpt["step"], ckpt["val_loss"]
@@ -364,7 +436,7 @@ def estimate_loss(model):
         losses = []
         for _ in range(EVAL_ITERS):
             x, y = get_batch(split)
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=(DTYPE == torch.bfloat16)):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(DEVICE == "cuda" and DTYPE == torch.bfloat16)):
                 _, loss = model(x, y)
             losses.append(loss.item())
         out[split] = sum(losses) / len(losses)
@@ -382,6 +454,10 @@ if __name__ == "__main__":
 
     # Initialize model
     model = MoEGPT()
+    if DEVICE == "cuda" and USE_TORCH_COMPILE:
+        # Full-graph mode is too brittle for dynamic shapes; max-autotune is a good speed/compat compromise.
+        model = torch.compile(model, mode="max-autotune", fullgraph=False)
+
     n_total  = sum(p.numel() for p in model.parameters())
     _expert1 = sum(p.numel() for p in model.blocks[0].moe.experts[0].parameters())
     n_active = n_total - _expert1 * (NUM_EXPERTS - TOP_K) * NUM_LAYERS
@@ -609,7 +685,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     for prompt in prompts:
-        output = model_eval.generate(prompt, max_new_tokens=120, temperature=0.7)
+        output = model_eval.generate(prompt, max_new_tokens=120, temperature=0.7, top_k=50, top_p=0.9)
         print(f"\nPrompt : \"{prompt}\"")
         print(f"Output : {output.strip()}")
         print()
@@ -629,7 +705,7 @@ if __name__ == "__main__":
             break
         if not prompt or prompt.lower() == "quit":
             break
-        output = model_eval.generate(prompt, max_new_tokens=150, temperature=0.8)
+        output = model_eval.generate(prompt, max_new_tokens=150, temperature=0.8, top_k=50, top_p=0.9)
         print(f"\n{output.strip()}")
 
     print("\nGoodbye!")

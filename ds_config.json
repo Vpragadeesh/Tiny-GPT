@@ -14,15 +14,6 @@
     }
   },
   
-  "scheduler": {
-    "type": "WarmupLR",
-    "params": {
-      "warmup_min_lr": 0,
-      "warmup_max_lr": 1.5e-4,
-      "warmup_num_steps": 500
-    }
-  },
-  
   "zero_optimization": {
     "stage": 2,
     "offload_optimizer": {

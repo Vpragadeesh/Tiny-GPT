@@ -132,10 +132,16 @@ if [ "$TRAIN_MODE" = "aggressive" ]; then
     export MAX_JOBS=$CPU_THREADS
     export OMP_NUM_THREADS=$CPU_THREADS
     export MKL_NUM_THREADS=$CPU_THREADS
+    export ALLOW_TF32=1
+    export USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-0}
+    export USE_ACTIVATION_CHECKPOINT=0
 else
     export MAX_JOBS=1
     export OMP_NUM_THREADS=1
     export MKL_NUM_THREADS=1
+    export ALLOW_TF32=1
+    export USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-0}
+    export USE_ACTIVATION_CHECKPOINT=1
 fi
 
 # Main script reads this active config path.
