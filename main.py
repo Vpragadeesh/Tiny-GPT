@@ -39,6 +39,7 @@ from rich import print as rprint
 from model import CausalSelfAttention, FeedForward, TransformerBlock, TinyGPT
 from tinygpt.attention import LinearAttention
 from tinygpt.training import CPUOffloadAdamW, get_lr, save_checkpoint, load_checkpoint, estimate_loss
+from eval_suite import eval_suite
 
 console = Console()
 
@@ -86,8 +87,9 @@ print()
 # ═════════════════════════════════════════════════════════════════════════════
 
 BLOCK_SIZE    = 512              # context window (tokens)
-MICRO_BATCH   = 2                # samples per GPU forward pass
-GRAD_ACCUM    = 8                # accumulate before optimizer step → eff. batch 16
+MICRO_BATCH   = 4                # samples per GPU forward pass (VRAM-limited to 4GB)
+GRAD_ACCUM    = 16               # gradient accumulation steps → eff. batch 64
+                                 # Total tokens/step: MICRO_BATCH * GRAD_ACCUM * BLOCK_SIZE
 EMBED_DIM     = 768              # model width (~124M params)
 NUM_HEADS     = 12               # attention heads (768 / 12 = 64 head_dim)
 NUM_LAYERS    = 12               # transformer blocks
@@ -102,6 +104,7 @@ USE_ACTIVATION_CHECKPOINT = True  # required for 124M on 4GB VRAM
 GRAD_CLIP     = 1.0
 ATTENTION_TYPE = "softmax"       # "softmax" (default) or "linear"
 CHECKPOINT_DIR = "checkpoints"   # directory for saving checkpoints
+EFFECTIVE_BATCH = MICRO_BATCH * GRAD_ACCUM  # eff. batch size (64)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE  = torch.bfloat16 if DEVICE == "cuda" else torch.float32
@@ -315,35 +318,36 @@ if __name__ == "__main__":
             )
 
             if step % EVAL_EVERY == 0 or step == 1:
-                losses = estimate_loss(model, get_batch, EVAL_ITERS,
-                                       use_activation_checkpoint=USE_ACTIVATION_CHECKPOINT)
+                losses = eval_suite(model, lambda s: get_batch(s), eval_iters=EVAL_ITERS,
+                                    device=DEVICE, verbose=False)
                 progress.update(
                     task,
-                    train_loss=f"{losses['train']:.4f}",
-                    val_loss=f"{losses['val']:.4f}",
+                    train_loss=f"{losses['train_loss']:.4f}",
+                    val_loss=f"{losses['val_loss']:.4f}",
                     lr=f"{lr:.6f}",
                     tok_s=f"{tok_s:,.0f}",
                 )
                 progress.console.print(
                     f"  [bold]Step {step:>5}[/]  │  "
-                    f"[yellow]Train {losses['train']:.4f}[/]  │  "
-                    f"[cyan]Val {losses['val']:.4f}[/]  │  "
+                    f"[yellow]Train {losses['train_loss']:.4f}[/]  │  "
+                    f"[cyan]Val {losses['val_loss']:.4f}  PPL {losses['val_ppl']:.1f}[/]  │  "
                     f"[magenta]LR {lr:.6f}[/]  │  "
-                    f"[bold cyan]{tok_s:,.0f} tok/s[/]"
+                    f"[bold cyan]{tok_s:,.0f} tok/s[/]  │  "
+                    f"[green]Acc {losses['token_accuracy']:.3f}[/]"
                 )
 
                 # ── Save checkpoints ──
                 save_checkpoint(
                     step, model, optimizer,
-                    losses["train"], losses["val"],
+                    losses["train_loss"], losses["val_loss"],
                     os.path.join(CHECKPOINT_DIR, "latest.pt"),
                     attention_type=ATTENTION_TYPE,
                 )
-                if losses["val"] < best_val:
-                    best_val = losses["val"]
+                if losses["val_loss"] < best_val:
+                    best_val = losses["val_loss"]
                     save_checkpoint(
                         step, model, optimizer,
-                        losses["train"], losses["val"],
+                        losses["train_loss"], losses["val_loss"],
                         os.path.join(CHECKPOINT_DIR, "best.pt"),
                         attention_type=ATTENTION_TYPE,
                     )

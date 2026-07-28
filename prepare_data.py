@@ -116,6 +116,11 @@ if __name__ == "__main__":
     counts_examples = {"train": 0, "val": 0, "test": 0}
     counts_tokens = {"train": 0, "val": 0, "test": 0}
 
+    total_examples = 0
+    low_diversity = 0
+    max_seq_len = 0
+    min_seq_len = float('inf')
+
     with open(out_paths["train"], "ab") as f_train, open(out_paths["val"], "ab") as f_val, open(out_paths["test"], "ab") as f_test:
         fps = {"train": f_train, "val": f_val, "test": f_test}
 
@@ -131,6 +136,17 @@ if __name__ == "__main__":
 
             split = pick_split(i, MAX_EXAMPLES)
             toks = encode_text(text)
+
+            total_examples += 1
+            max_seq_len = max(max_seq_len, len(toks))
+            min_seq_len = min(min_seq_len, len(toks))
+
+            # Data quality: skip sequences with very low token diversity
+            if len(set(toks)) < 50:
+                low_diversity += 1
+                progress.update(1)
+                continue
+
             buffers[split].extend(toks)
             counts_examples[split] += 1
 
@@ -146,6 +162,11 @@ if __name__ == "__main__":
 
         for split in ("train", "val", "test"):
             counts_tokens[split] += flush_tokens(fps[split], buffers[split])
+
+    print(f"\nDataset quality report:")
+    print(f"  Total examples processed: {total_examples}")
+    print(f"  Low diversity skipped:   {low_diversity} ({100*low_diversity/max(total_examples,1):.1f}%)")
+    print(f"  Sequence length range:   {min_seq_len} – {max_seq_len} tokens")
 
     print("\nDone.")
     for split in ("train", "val", "test"):

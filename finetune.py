@@ -22,6 +22,7 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 import tiktoken
 from model import CausalSelfAttention, FeedForward, TransformerBlock, TinyGPT
 from tinygpt.training import CPUOffloadAdamW, get_lr, save_checkpoint, estimate_loss
+from eval_suite import eval_suite
 from rich.progress import (
     Progress, BarColumn, TextColumn, TimeRemainingColumn, TimeElapsedColumn,
     SpinnerColumn, MofNCompleteColumn,
@@ -75,20 +76,22 @@ if __name__ == "__main__":
     # ═════════════════════════════════════════════════════════════════════════════
 
     BLOCK_SIZE    = 512              # context window (tokens) — must match pre-trained
-    MICRO_BATCH   = 2                # samples per GPU forward pass
-    GRAD_ACCUM    = 8                # accumulate before optimizer step
+    MICRO_BATCH   = 4                # samples per GPU forward pass
+    GRAD_ACCUM    = 16               # accumulate before optimizer step → eff. batch 64
     EMBED_DIM     = 768              # model width (must match pre-trained 124M)
     NUM_HEADS     = 12               # attention heads
     NUM_LAYERS    = 12               # transformer blocks
     FFN_DIM       = EMBED_DIM * 4   # 3072
     DROPOUT       = 0.1
     LR            = 2e-5             # LOW learning rate — preserve pre-trained weights
+                                     # (10x lower than pre-training LR=1.5e-4)
     WARMUP_STEPS  = 500
     MAX_ITERS     = 10_000           # instruction tuning steps
     EVAL_EVERY    = 1_000
     EVAL_ITERS    = 50
     USE_ACTIVATION_CHECKPOINT = True  # required for 124M on 4GB VRAM
     GRAD_CLIP     = 1.0
+    EFFECTIVE_BATCH = MICRO_BATCH * GRAD_ACCUM
     CHECKPOINT_DIR = "checkpoints"
     PRETRAINED_CKPT = os.path.join(CHECKPOINT_DIR, "best.pt")
 
@@ -241,33 +244,35 @@ if __name__ == "__main__":
             )
 
             if step % EVAL_EVERY == 0 or step == 1:
-                losses = estimate_loss(model, get_batch, EVAL_ITERS)
+                losses = eval_suite(model, lambda s: get_batch(s), eval_iters=EVAL_ITERS,
+                                    device=DEVICE, verbose=False)
                 progress.update(
                     task,
-                    train_loss=f"{losses['train']:.4f}",
-                    val_loss=f"{losses['val']:.4f}",
+                    train_loss=f"{losses['train_loss']:.4f}",
+                    val_loss=f"{losses['val_loss']:.4f}",
                     lr=f"{lr:.6f}",
                     tok_s=f"{tok_s:,.0f}",
                 )
                 progress.console.print(
                     f"  [bold]Step {step:>5}[/]  │  "
-                    f"[yellow]Train {losses['train']:.4f}[/]  │  "
-                    f"[cyan]Val {losses['val']:.4f}[/]  │  "
+                    f"[yellow]Train {losses['train_loss']:.4f}[/]  │  "
+                    f"[cyan]Val {losses['val_loss']:.4f}  PPL {losses['val_ppl']:.1f}[/]  │  "
                     f"[magenta]LR {lr:.6f}[/]  │  "
-                    f"[bold cyan]{tok_s:,.0f} tok/s[/]"
+                    f"[bold cyan]{tok_s:,.0f} tok/s[/]  │  "
+                    f"[green]Acc {losses['token_accuracy']:.3f}[/]"
                 )
 
                 # Save fine-tuned checkpoints (separate from pre-trained)
                 save_checkpoint(
                     step, model, optimizer,
-                    losses["train"], losses["val"],
+                    losses["train_loss"], losses["val_loss"],
                     os.path.join(CHECKPOINT_DIR, "finetune_latest.pt"),
                 )
-                if losses["val"] < best_val:
-                    best_val = losses["val"]
+                if losses["val_loss"] < best_val:
+                    best_val = losses["val_loss"]
                     save_checkpoint(
                         step, model, optimizer,
-                        losses["train"], losses["val"],
+                        losses["train_loss"], losses["val_loss"],
                         os.path.join(CHECKPOINT_DIR, "finetune_best.pt"),
                     )
                     progress.console.print(
