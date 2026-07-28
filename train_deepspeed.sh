@@ -90,8 +90,8 @@ if mode == "aggressive":
     act_ckpt["cpu_checkpointing"] = False
 else:
     # Low-resource profile (current stable baseline).
-    cfg["train_micro_batch_size_per_gpu"] = 1
-    cfg["gradient_accumulation_steps"] = 4
+    cfg["train_micro_batch_size_per_gpu"] = 2
+    cfg["gradient_accumulation_steps"] = 8
     cfg["train_batch_size"] = cfg["train_micro_batch_size_per_gpu"] * cfg["gradient_accumulation_steps"] * max(1, num_gpus)
     off_opt["pin_memory"] = False
     zero["reduce_bucket_size"] = 1e6

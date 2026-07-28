@@ -1,22 +1,20 @@
 """
-MoE GPT – 0.5 Billion Parameter Language Model (DeepSpeed ZeRO-3)
-==================================================================
-Mixture-of-Experts GPT trained on FineWeb-Edu with DeepSpeed ZeRO-Infinity:
-  - ZeRO Stage 3: All states partitioned across GPUs + CPU RAM offload
-  - CPU Offloading: Parameters & optimizer states in CPU RAM
-  - Memory efficient: Fits massive models on limited VRAM
-  - Automatic gradient checkpointing & mixed precision (bfloat16)
+Tiny-GPT – Dense Transformer Language Model (DeepSpeed ZeRO-2)
+==============================================================
+Dense GPT trained on FineWeb-Edu with DeepSpeed ZeRO-2:
+  - ZeRO Stage 2: Optimizer states partitioned across GPUs + CPU offload
+  - BF16 mixed precision with FlashAttention
+  - Automatic gradient checkpointing support
 
 Architecture
-  12 Transformer layers  ×  (12-head attention  +  MoE FFN)
-  8 expert FFNs per layer, top-2 routing
-  Total params  ≈ 521 M   |   Active per token  ≈ 180 M
+  8 Transformer layers  ×  (8-head attention  +  Dense FFN)
+  Total params  ≈ 101 M
 
 Run order:
     pip install torch tiktoken numpy datasets deepspeed
-    python prepare_data.py          # once — downloads FineWeb-Edu
-    deepspeed --num_gpus 1 main.py  # train with DeepSpeed
-    python run.py                   # generate
+    python prepare_data.py              # once — downloads FineWeb-Edu
+    deepspeed --num_gpus 1 main_deepspeed.py  # train with DeepSpeed
+    python run.py                       # generate
 """
 
 import os
@@ -24,6 +22,7 @@ import sys
 import math
 import gc
 import json
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import numpy as np
@@ -33,6 +32,8 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 import tiktoken
 import deepspeed
+from model import CausalSelfAttention, FeedForward, TransformerBlock, TinyGPT
+from tinygpt.training import get_lr, estimate_loss
 from rich.progress import (
     Progress, BarColumn, TextColumn, TimeRemainingColumn, TimeElapsedColumn,
     SpinnerColumn, MofNCompleteColumn,
@@ -91,18 +92,19 @@ GRAD_ACCUM    = 4                # accumulate before optimizer step → eff. bat
 EMBED_DIM     = 512              # model width
 NUM_HEADS     = 8                # attention heads
 NUM_LAYERS    = 8                # transformer blocks
-NUM_EXPERTS   = 4                # expert FFNs per MoE layer
-TOP_K         = 2                # experts activated per token
 FFN_DIM       = EMBED_DIM * 4   # 2 048  (expert hidden dim)
 DROPOUT       = 0.1
-LR            = 1.5e-4           # peak learning rate
+LR            = 5.0e-5           # peak learning rate (tuned for 101M model + batch 16)
 WARMUP_STEPS  = 500              # linear warmup
 MAX_ITERS     = 120_000           # total optimiser steps
 EVAL_EVERY    = 2_000
 EVAL_ITERS    = 50
-AUX_LOSS_W    = 0.01             # load-balancing auxiliary loss weight
 GRAD_CLIP     = 1.0
 CHECKPOINT_DIR = "checkpoints"   # directory for saving checkpoints
+# ── Auto-stop ───────────────────────────────────────────────────────────
+PATIENCE            = 5          # eval steps without improvement → stop
+LOSS_EXPLODE_FACTOR = 1.5        # stop if val loss > best * factor
+NAN_STOP            = True       # stop immediately on NaN
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE  = torch.bfloat16 if DEVICE == "cuda" else torch.float32
@@ -120,7 +122,7 @@ if DEVICE == "cuda":
 
 print(f"Device          : {DEVICE.upper()}")
 print(f"Precision       : {'BF16 (DeepSpeed)' if DTYPE == torch.bfloat16 else 'FP32'}")
-print(f"Effective batch (default) : {MICRO_BATCH * GRAD_ACCUM}")
+print(f"Eff batch (Py) : {MICRO_BATCH * GRAD_ACCUM}  (DeepSpeed config may override)")
 print(f"TF32            : {'ON' if (DEVICE == 'cuda' and ALLOW_TF32) else 'OFF'}")
 print(f"Torch compile   : {'ON' if USE_TORCH_COMPILE else 'OFF'}")
 print(f"Act checkpoint  : {'ON' if USE_ACTIVATION_CHECKPOINT else 'OFF'}")
@@ -138,203 +140,38 @@ def get_batch(split="train"):
     return torch.from_numpy(x).to(DEVICE), torch.from_numpy(y).to(DEVICE)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 5. MODEL — Mixture-of-Experts GPT  (~0.5 B params)
+# 5. MODEL — see model.py for TinyGPT, TransformerBlock, FeedForward, CausalSelfAttention
 # ═════════════════════════════════════════════════════════════════════════════
 
-class CausalSelfAttention(nn.Module):
-    """Multi-head causal self-attention with fused QKV projection."""
+@torch.no_grad()
+def generate(model, prompt: str, max_new_tokens=200, temperature=0.8, top_k=50, top_p=0.9):
+    model.eval()
+    ids = encode(prompt)
+    idx = torch.tensor([ids], dtype=torch.long, device=DEVICE)
 
-    def __init__(self):
-        super().__init__()
-        self.n_heads  = NUM_HEADS
-        self.head_dim = EMBED_DIM // NUM_HEADS
-        self.qkv      = nn.Linear(EMBED_DIM, 3 * EMBED_DIM, bias=False)
-        self.proj      = nn.Linear(EMBED_DIM, EMBED_DIM, bias=False)
-        self.attn_drop = nn.Dropout(DROPOUT)
-        self.proj_drop = nn.Dropout(DROPOUT)
-        self.register_buffer(
-            "mask",
-            torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE))
-                .view(1, 1, BLOCK_SIZE, BLOCK_SIZE),
-        )
+    for _ in range(max_new_tokens):
+        ctx = idx[:, -BLOCK_SIZE:]
+        logits, _ = model(ctx)
+        logits = logits[:, -1, :].float() / temperature
 
-    def forward(self, x):
-        B, T, C = x.shape
-        qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)          # each (B, H, T, D)
+        if top_k is not None:
+            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits[indices_to_remove] = float("-inf")
 
-        att = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att.float(), dim=-1).to(x.dtype)   # softmax in fp32
-        att = self.attn_drop(att)
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumsum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumsum_probs > top_p
+            sorted_indices_to_remove[..., 0] = False
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            logits[:, indices_to_remove] = float("-inf")
 
-        out = (att @ v).transpose(1, 2).reshape(B, T, C)
-        return self.proj_drop(self.proj(out))
+        probs  = F.softmax(logits, dim=-1)
+        nxt    = torch.multinomial(probs, 1)
+        idx    = torch.cat([idx, nxt], dim=1)
 
-
-class ExpertFFN(nn.Module):
-    """Single expert: two-layer FFN with GELU."""
-
-    def __init__(self):
-        super().__init__()
-        self.w1   = nn.Linear(EMBED_DIM, FFN_DIM)
-        self.w2   = nn.Linear(FFN_DIM, EMBED_DIM)
-        self.act  = nn.GELU()
-        self.drop = nn.Dropout(DROPOUT)
-
-    def forward(self, x):
-        return self.drop(self.w2(self.act(self.w1(x))))
-
-
-class MoELayer(nn.Module):
-    """
-    Mixture-of-Experts: routes each token to TOP_K of NUM_EXPERTS FFNs.
-    Includes Switch-Transformer-style load-balancing auxiliary loss.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.router  = nn.Linear(EMBED_DIM, NUM_EXPERTS, bias=False)
-        self.experts = nn.ModuleList([ExpertFFN() for _ in range(NUM_EXPERTS)])
-
-    def forward(self, x):
-        B, T, C = x.shape
-        flat = x.reshape(-1, C)                              # (N, C)
-        N = flat.shape[0]
-
-        # ── routing ──
-        logits = self.router(flat)                            # (N, E)
-        probs  = F.softmax(logits.float(), dim=-1)            # fp32 for stability
-
-        top_w, top_i = torch.topk(probs, TOP_K, dim=-1)      # (N, K)
-        top_w = (top_w / top_w.sum(dim=-1, keepdim=True)).to(x.dtype)
-
-        # ── load-balancing loss ──
-        one_hot = F.one_hot(top_i, NUM_EXPERTS).float().sum(dim=1)   # (N, E)
-        f = one_hot.mean(dim=0)
-        P = probs.mean(dim=0)
-        aux_loss = NUM_EXPERTS * (f * P).sum()
-
-        # ── dispatch to experts ──
-        out = torch.zeros_like(flat)
-        for i, expert in enumerate(self.experts):
-            mask = (top_i == i).any(dim=-1)                   # (N,)
-            if not mask.any():
-                continue
-            tokens  = flat[mask]                              # (n_i, C)
-            e_out   = expert(tokens)                          # (n_i, C)
-            match   = (top_i[mask] == i).to(x.dtype)          # (n_i, K)
-            weights = (top_w[mask] * match).sum(-1, keepdim=True)
-            out[mask] += weights * e_out
-
-        return out.reshape(B, T, C), aux_loss
-
-
-class TransformerBlock(nn.Module):
-    """Pre-norm Transformer block: Attention + MoE, with residuals."""
-
-    def __init__(self):
-        super().__init__()
-        self.ln1  = nn.LayerNorm(EMBED_DIM)
-        self.attn = CausalSelfAttention()
-        self.ln2  = nn.LayerNorm(EMBED_DIM)
-        self.moe  = MoELayer()
-
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        moe_out, aux = self.moe(self.ln2(x))
-        x = x + moe_out
-        return x, aux
-
-
-class MoEGPT(nn.Module):
-    """
-    Full MoE-GPT model (~521 M parameters, ~180 M active per token).
-
-    1. Token + positional embeddings
-    2. 12 × Transformer blocks  (self-attention + MoE FFN)
-    3. Final layer-norm → linear head (weight-tied with token embedding)
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.tok_emb = nn.Embedding(vocab_size, EMBED_DIM)
-        self.pos_emb = nn.Embedding(BLOCK_SIZE, EMBED_DIM)
-        self.drop    = nn.Dropout(DROPOUT)
-        self.blocks  = nn.ModuleList([TransformerBlock() for _ in range(NUM_LAYERS)])
-        self.ln_f    = nn.LayerNorm(EMBED_DIM)
-        self.head    = nn.Linear(EMBED_DIM, vocab_size, bias=False)
-
-        # Weight tying saves ~38 M params and improves training
-        self.head.weight = self.tok_emb.weight
-        self._init_weights()
-
-    def _init_weights(self):
-        """GPT-2-style init with scaled residual projections."""
-        for name, p in self.named_parameters():
-            if p.dim() >= 2:
-                nn.init.normal_(p, mean=0.0, std=0.02)
-            elif "bias" in name:
-                nn.init.zeros_(p)
-        scale = (2 * NUM_LAYERS) ** -0.5
-        for block in self.blocks:
-            nn.init.normal_(block.attn.proj.weight, mean=0.0, std=0.02 * scale)
-            for expert in block.moe.experts:
-                nn.init.normal_(expert.w2.weight, mean=0.0, std=0.02 * scale)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        x = self.drop(
-            self.tok_emb(idx) + self.pos_emb(torch.arange(T, device=idx.device))
-        )
-
-        total_aux = 0.0
-        for block in self.blocks:
-            if self.training and USE_ACTIVATION_CHECKPOINT:
-                x, aux = grad_checkpoint(block, x, use_reentrant=False)
-            else:
-                x, aux = block(x)
-            total_aux = total_aux + aux
-
-        logits = self.head(self.ln_f(x))
-
-        loss = None
-        if targets is not None:
-            ce   = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
-            loss = ce + AUX_LOSS_W * total_aux
-        return logits, loss
-
-    @torch.no_grad()
-    def generate(self, prompt: str, max_new_tokens=200, temperature=0.8, top_k=50, top_p=0.9):
-        self.eval()
-        ids = encode(prompt)
-        idx = torch.tensor([ids], dtype=torch.long, device=DEVICE)
-
-        for _ in range(max_new_tokens):
-            ctx = idx[:, -BLOCK_SIZE:]
-            logits, _ = self(ctx)
-            logits = logits[:, -1, :].float() / temperature
-
-            # Top-K filtering
-            if top_k is not None:
-                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-                logits[indices_to_remove] = float("-inf")
-
-            # Top-P (nucleus) filtering
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumsum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumsum_probs > top_p
-                sorted_indices_to_remove[..., 0] = False
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                logits[:, indices_to_remove] = float("-inf")
-
-            probs  = F.softmax(logits, dim=-1)
-            nxt    = torch.multinomial(probs, 1)
-            idx    = torch.cat([idx, nxt], dim=1)
-
-        self.train()
-        return decode(idx[0].tolist())
+    model.train()
+    return decode(idx[0].tolist())
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 6. CHECKPOINT HELPERS
@@ -406,14 +243,8 @@ def load_checkpoint(path, model):
     return ckpt["step"], ckpt["val_loss"]
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 7. LEARNING-RATE SCHEDULE  (linear warmup → cosine decay to 10 %)
+# 7. LEARNING-RATE SCHEDULE — see tinygpt.training.get_lr
 # ═════════════════════════════════════════════════════════════════════════════
-
-def get_lr(step):
-    if step < WARMUP_STEPS:
-        return LR * step / WARMUP_STEPS
-    progress = (step - WARMUP_STEPS) / max(1, MAX_ITERS - WARMUP_STEPS)
-    return LR * 0.1 + 0.5 * LR * 0.9 * (1 + math.cos(math.pi * progress))
 
 
 def get_eta_clock(progress, task_id):
@@ -453,14 +284,13 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
 
     # Initialize model
-    model = MoEGPT()
+    model = TinyGPT(vocab_size, BLOCK_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS,
+                    FFN_DIM, DROPOUT)
     if DEVICE == "cuda" and USE_TORCH_COMPILE:
-        # Full-graph mode is too brittle for dynamic shapes; max-autotune is a good speed/compat compromise.
         model = torch.compile(model, mode="max-autotune", fullgraph=False)
 
     n_total  = sum(p.numel() for p in model.parameters())
-    _expert1 = sum(p.numel() for p in model.blocks[0].moe.experts[0].parameters())
-    n_active = n_total - _expert1 * (NUM_EXPERTS - TOP_K) * NUM_LAYERS
+    n_active = n_total  # In a dense model, all parameters are active
 
     print(f"Total  parameters : {n_total:>14,}")
     print(f"Active per token  : {n_active:>14,}")
@@ -514,6 +344,8 @@ if __name__ == "__main__":
     start_step = 0
     best_val = float("inf")
     prev_val = None
+    steps_without_improvement = 0
+    stop_reason = None
 
     # Auto-resume from latest checkpoint (with NaN guard)
     latest_ckpt = os.path.join(CHECKPOINT_DIR, "latest.pt")
@@ -555,6 +387,8 @@ if __name__ == "__main__":
         TextColumn("[yellow]loss {task.fields[train_loss]}"),
         TextColumn("[cyan]val {task.fields[val_loss]}"),
         TextColumn("[magenta]lr {task.fields[lr]}"),
+        TextColumn("•"),
+        TextColumn("[bold cyan]{task.fields[tok_s]} tok/s"),
         console=console,
         refresh_per_second=4,
     ) as progress:
@@ -562,16 +396,19 @@ if __name__ == "__main__":
         task = progress.add_task(
             "Training", total=total_steps,
             train_loss="--.----", val_loss="--.----", lr="--.------", end_clock="--:--",
+            tok_s="------",
         )
 
         step = start_step
         micro_loss_sum = 0.0
         micro_loss_count = 0
         total_micro_steps = MAX_ITERS * GRAD_ACCUM
+        step_start_time = time.perf_counter()
+        tokens_per_step = MICRO_BATCH * GRAD_ACCUM * BLOCK_SIZE
 
         for micro_step in range(start_step * GRAD_ACCUM + 1, total_micro_steps + 1):
 
-            lr = get_lr(step + 1)
+            lr = get_lr(step + 1, LR, WARMUP_STEPS, MAX_ITERS)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
@@ -593,11 +430,17 @@ if __name__ == "__main__":
             micro_loss_sum = 0.0
             micro_loss_count = 0
 
+            now = time.perf_counter()
+            elapsed = now - step_start_time
+            step_start_time = now
+            tok_s = tokens_per_step / elapsed if elapsed > 0 else 0
+
             progress.update(
                 task,
                 advance=1,
                 train_loss=f"{accum_loss:.4f}",
                 lr=f"{lr:.6f}",
+                tok_s=f"{tok_s:,.0f}",
                 end_clock=get_eta_clock(progress, task),
             )
 
@@ -621,13 +464,15 @@ if __name__ == "__main__":
                     train_loss=f"{losses['train']:.4f}",
                     val_loss=f"{losses['val']:.4f}",
                     lr=f"{lr:.6f}",
+                    tok_s=f"{tok_s:,.0f}",
                     end_clock=get_eta_clock(progress, task),
                 )
                 progress.console.print(
                     f"  [bold]Step {step:>5}[/]  │  "
                     f"[yellow]Train {losses['train']:.4f}[/]  │  "
                     f"[cyan]Val {losses['val']:.4f} ({trend}, Δ {delta:+.4f})[/]  │  "
-                    f"[magenta]LR {lr:.6f}[/]"
+                    f"[magenta]LR {lr:.6f}[/]  │  "
+                    f"[bold cyan]{tok_s:,.0f} tok/s[/]"
                 )
 
                 # Save checkpoints
@@ -638,6 +483,7 @@ if __name__ == "__main__":
                 )
                 if losses["val"] < best_val:
                     best_val = losses["val"]
+                    steps_without_improvement = 0
                     save_checkpoint(
                         step, model_engine.module if hasattr(model_engine, 'module') else model_engine,
                         losses["train"], losses["val"],
@@ -646,8 +492,30 @@ if __name__ == "__main__":
                     progress.console.print(
                         f"  [bold green]★ New best val loss: {best_val:.4f}  (saved best.pt)[/]"
                     )
+                else:
+                    steps_without_improvement += 1
 
-            if step >= MAX_ITERS:
+                # ── Auto-stop checks ──
+                val_l = losses["val"]
+                if math.isnan(val_l) or math.isnan(losses["train"]):
+                    stop_reason = "NaN loss detected"
+                elif best_val > 0 and val_l > best_val * LOSS_EXPLODE_FACTOR:
+                    stop_reason = f"Loss exploded: {val_l:.4f} > {best_val:.4f} × {LOSS_EXPLODE_FACTOR}"
+                elif steps_without_improvement >= PATIENCE:
+                    stop_reason = f"No improvement for {PATIENCE} evals (best {best_val:.4f})"
+
+                if stop_reason:
+                    progress.console.print(
+                        f"  [bold red]⛔ STOPPING: {stop_reason}[/]"
+                    )
+                    save_checkpoint(
+                        step, model_engine.module if hasattr(model_engine, 'module') else model_engine,
+                        losses["train"], losses["val"],
+                        os.path.join(CHECKPOINT_DIR, "latest.pt"),
+                    )
+                    break
+
+            if step >= MAX_ITERS or stop_reason:
                 break
 
     print()
@@ -685,7 +553,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     for prompt in prompts:
-        output = model_eval.generate(prompt, max_new_tokens=120, temperature=0.7, top_k=50, top_p=0.9)
+        output = generate(model_eval, prompt, max_new_tokens=120, temperature=0.7, top_k=50, top_p=0.9)
         print(f"\nPrompt : \"{prompt}\"")
         print(f"Output : {output.strip()}")
         print()
@@ -705,7 +573,7 @@ if __name__ == "__main__":
             break
         if not prompt or prompt.lower() == "quit":
             break
-        output = model_eval.generate(prompt, max_new_tokens=150, temperature=0.8, top_k=50, top_p=0.9)
+        output = generate(model_eval, prompt, max_new_tokens=150, temperature=0.8, top_k=50, top_p=0.9)
         print(f"\n{output.strip()}")
 
     print("\nGoodbye!")
