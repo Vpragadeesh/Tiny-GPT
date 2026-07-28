@@ -1,279 +1,107 @@
-# Tiny-GPT: 0.5B MoE Language Model
+# Tiny-GPT: 124M Dense Transformer
 
-A clean, efficient implementation of a **Mixture-of-Experts GPT** that fits on modest GPUs (4GB VRAM) while training on large datasets.
+A minimal, efficient GPT-2 Small implementation optimized for training on modest GPUs (4GB VRAM) and quantization research.
 
-## 🎯 Main Goal
-**Generate proper English text** - not gibberish!
+## Architecture
 
-## 📊 Quick Stats
+- **Model**: 124M parameter dense transformer (no MoE)
+- **Config**: 12 layers, 768-dim, 12 heads, 512 context window
+- **Tokenizer**: GPT-2 BPE (50,257 vocab via tiktoken)
+- **Training Data**: FineWeb-Edu (9.75B tokens) + Alpaca instruction fine-tuning
+- **Hardware**: RTX 2050 (4GB VRAM) via CPUOffloadAdamW
 
-| Metric | Value |
-|--------|-------|
-| **Model Size** | 0.5B parameters (520M) |
-| **Active per Token** | 180M parameters (via MoE routing) |
-| **Architecture** | 12 Transformer layers, 8 experts/layer, top-2 routing |
-| **Training Data** | WikiText-103 (103M tokens, ~500MB) |
-| **GPU Memory** | 0.97 GiB (model weights only) |
-| **Training Time** | ~10-20 hours on RTX 2050 (10k steps) |
-| **Tokenizer** | GPT-2 BPE (50,257 vocab via tiktoken) |
-
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Prepare Dataset
 ```bash
 python prepare_data.py
 ```
-Downloads WikiText-103 and tokenizes to memory-mapped binary files (~500MB).
-This is a one-time operation that takes **10-30 minutes**.
+Streams and tokenizes FineWeb-Edu from HuggingFace to memory-mapped .bin files.
 
-### 2. Train
+### 2. Pre-train
 ```bash
 python main.py
 ```
-Starts training from scratch with:
-- **Learning rate**: 1.5e-4 (lowered for stability)
-- **Warmup**: 500 steps (better convergence)
-- **Total steps**: 10,000 (more thorough training)
-- **Batch size**: 16 (gradient accumulation of 2x8)
+Trains 124M dense GPT-2 from scratch with:
+- **Learning rate**: 1.5e-4 with cosine decay
+- **Warmup**: 500 steps
+- **Total steps**: 50,000
+- **Effective batch**: 64 (MICRO_BATCH=4, GRAD_ACCUM=16)
 
-Training progress shows in real-time via rich progress bar.
-
-### 3. Generate Text
+### 3. Fine-tune (optional)
 ```bash
-python run.py
+python finetune.py
+```
+Fine-tunes on Alpaca instruction data. Must have pre-trained `best.pt` first.
+
+### 4. Generate Text
+```bash
+python run.py --prompt "Hello"
+python chat.py  # interactive chat (fine-tuned model)
 ```
 
-## 🤗 Use Hugging Face Hub (instead of local/GitHub checkpoints)
-
-### 1. Upload checkpoints to HF Hub
+### 5. DeepSpeed Training (multi-GPU)
 ```bash
-pip install huggingface_hub
-export HF_TOKEN=your_hf_token
-python push_to_hf.py --repo-id yourname/Tiny-GPT
+bash train_deepspeed.sh
 ```
 
-This uploads:
-- `checkpoints/best.pt` → `best.pt`
-- `checkpoints/latest.pt` → `latest.pt` (if present)
+## Memory Optimization
 
-### 2. Run inference directly from HF Hub
-```bash
-python run.py --hf-repo yourname/Tiny-GPT --prompt "The future of AI is"
-```
+The CPUOffloadAdamW optimizer keeps fp32 master weights + momentum/variance on CPU RAM to fit on 4GB VRAM:
+- **GPU**: bf16 model weights + gradients (~1 GB)
+- **CPU**: fp32 master weights + fp32 m/v (~6 GB)
 
-Optional flags:
-- `--hf-filename best.pt`
-- `--hf-revision main`
-- `--hf-token <token>` (or use `HF_TOKEN` env var)
+## Evaluation
 
-## 📁 File Structure
+The `eval_suite.py` module tracks:
+- Train/val loss & perplexity
+- Token accuracy
+- Generation diversity ratio
+- Generation samples
+
+Integrated into the training loop -- visible in progress bar output.
+
+## File Structure
 
 ```
 Tiny-GPT/
-├── main.py                  # Training script
-├── run.py                   # Inference script (NEW)
-├── prepare_data.py          # Dataset preparation
-├── mini_gpt.py              # Deprecated v1 (reference only)
-├── reset_training.sh        # Clean old checkpoints
-├── wait_for_dataset.sh      # Monitor data preparation
-│
-├── data/
-│   ├── train.bin            # ~1.8M examples → ~80M tokens
-│   ├── val.bin              # ~3.7k examples → ~1.7M tokens
-│   ├── test.bin             # ~4.3k examples → ~2.0M tokens
-│   └── meta.txt             # Metadata
-│
-└── checkpoints/
-    ├── latest.pt            # Most recent checkpoint
-    └── best.pt              # Best validation loss checkpoint
+├── main.py                  # Pre-training script
+├── main_deepspeed.py        # DeepSpeed ZeRO-2 variant
+├── finetune.py              # Instruction fine-tuning
+├── run.py                   # Inference (interactive/single/batch/HF Hub)
+├── chat.py                  # Interactive chat (fine-tuned)
+├── prepare_data.py          # FineWeb-Edu streaming -> .bin files
+├── prepare_chat_data.py     # Alpaca -> .bin files
+├── push_to_hf.py            # Upload checkpoints to HuggingFace Hub
+├── eval_suite.py            # Comprehensive evaluation metrics
+├── benchmark_attention.py   # Softmax vs linear attention benchmark
+├── model.py                 # TinyGPT model definition
+├── tinygpt/                 # Modular package
+│   ├── attention/           # CausalSelfAttention, LinearAttention
+│   ├── layers/              # FeedForward, TransformerBlock
+│   ├── training/            # CPUOffloadAdamW, scheduler, checkpoint
+│   └── generation/          # (pending)
+├── data/                    # Pre-training binary data
+├── instruction_data/        # Fine-tuning binary data (Alpaca)
+└── tests/                   # Unit tests
+    └── test_model.py
 ```
 
-## 🔧 Configuration
+## Dependencies
 
-All hyperparameters are defined in `main.py`:
-
-```python
-BLOCK_SIZE    = 128              # Context window
-EMBED_DIM     = 768              # Model width
-NUM_LAYERS    = 12               # Transformer blocks
-NUM_EXPERTS   = 8                # Experts per MoE layer
-TOP_K         = 2                # Experts used per token
-LR            = 1.5e-4           # Learning rate (adjusted)
-WARMUP_STEPS  = 500              # Warmup schedule
-MAX_ITERS     = 10000            # Total training steps
-GRAD_CLIP     = 1.0              # Gradient clipping
-```
-
-## 📈 Expected Training Progress
-
-**With fixed hyperparameters (new):**
-- **Step 1**: Loss ~8.0
-- **Step 500**: Loss ~6.5-7.0
-- **Step 2500**: Loss ~4.5-5.0
-- **Step 5000**: Loss ~3.8-4.2
-- **Step 10000**: Loss ~3.5-3.8
-
-**Quality indicator:** Model starts generating coherent English by step 2000+
-
-## 💡 What Changed?
-
-### Before (Broken)
-```
-Learning Rate: 3e-4 (too high)
-Warmup: 200 steps (insufficient)
-Auto-resume: Enabled (got stuck in NaN)
-Trainer Loss: DIVERGES TO NAN
-Output: "hi defencesaternal Thirty shows allowanceBad Leh..."  ❌
-```
-
-### After (Fixed)
-```
-Learning Rate: 1.5e-4 (stable)
-Warmup: 500 steps (better convergence)
-Auto-resume: Disabled (start fresh)
-Training Loss: SMOOTH CONVERGENCE
-Output: "The history of the universe began with the Big Bang..."  ✓
-```
-
-## 🧠 Model Architecture
-
-```
-Input Tokens
-    ↓
-Embedding + Positional Encoding (768-dim)
-    ↓
-[x12 Transformer Blocks]
-  ├─ Multi-Head Attention (12 heads)
-  │  └─ Output: 768-dim
-  └─ Mixture-of-Experts Layer
-     ├─ 8 Expert FFNs (768→3072→768)
-     ├─ Router: Selects top-2 experts per token
-     └─ Load-balancing auxiliary loss
-    ↓
-Layer Norm
-    ↓
-Output Linear → Logits (50,257)
-    ↓
-Cross-Entropy Loss
-```
-
-**Memory Trick:** The CPUOffloadAdamW optimizer keeps fp32 master weights + momentum/variance on CPU RAM to save GPU VRAM:
-- GPU: fp16 model weights + fp16 gradients (~1 GB)
-- CPU: fp32 master weights + fp32 m/v (~4 GB)
-
-## 🎮 Using `run.py`
-
-### Interactive Mode (Default)
 ```bash
-python run.py
-```
-Type prompts and press Enter. Commands:
-- `/temp 0.8` - Set temperature (higher = more random)
-- `/len 150` - Set max tokens
-- `/topk 40` - Enable top-k sampling
-- `/topp 0.9` - Set nucleus sampling threshold
-- `quit` - Exit
-
-### Single Prompt
-```bash
-python run.py --prompt "The future of AI is"
+pip install torch tiktoken numpy rich datasets tqdm
+# Optional:
+pip install deepspeed          # Multi-GPU training
+pip install huggingface_hub    # Upload/download checkpoints
 ```
 
-### Batch from File
-```bash
-python run.py --prompts prompts.txt  # One prompt per line
-```
+## Known Issues
 
-### Custom Checkpoint
-```bash
-python run.py --checkpoint checkpoints/best.pt
-```
+- **Weight tying**: `head.weight` is tied to `tok_emb.weight`. Checkpoints from older training runs with separate `head.weight` are handled in `load_checkpoint()`.
+- **Checkpoint key**: Unified to `model_state` across all training scripts.
+- **chat.py**: Requires a fine-tuned checkpoint. Falls back to pre-trained if not available. Checkpoint dimension mismatches may occur with different model configs.
 
-### Full Options
-```bash
-python run.py --help
-```
+## License
 
-## 🔍 Monitoring Training
-
-The training loop shows:
-```
-Step  5000  │  Train 4.23  │  Val 4.45  │  LR 0.000097
-```
-
-**Healthy indicators:**
-- ✓ Train loss smoothly decreases
-- ✓ Val loss follows trend
-- ✓ No NaN values
-- ✓ Learning rate schedule works
-- ✓ No gradient clipping (or occasional, < 10% of steps)
-
-**Red flags:**
-- ❌ Loss jumps/oscillates wildly
-- ❌ NaN values appear
-- ❌ Val loss stops improving (need more data or different HP)
-- ❌ Constant gradient clipping (reduce LR)
-
-## 📊 Checkpointing
-
-Saved automatically every 500 steps:
-- **`latest.pt`**: Most recent checkpoint (always usable)
-- **`best.pt`**: Best validation loss (for inference)
-
-Load in Python:
-```python
-checkpoint = torch.load("checkpoints/best.pt", map_location="cpu")
-model.load_state_dict(checkpoint["model"])
-optimizer.load_state_dict(checkpoint["optimizer"])
-step = checkpoint["step"]
-```
-
-## 🛑 Troubleshooting
-
-### Dataset not preparing
-```bash
-# Monitor progress
-./wait_for_dataset.sh
-
-# Check manually
-ls -lh data/
-```
-
-### Training produces NaN
-✓ **Fixed**: Lowered learning rate to 1.5e-4 and increased warmup
-
-### Model outputs gibberish
-✓ **Fixed**: Trained on larger dataset (WikiText-103 vs WikiText-2)
-
-### Out of memory
-- Reduce `MICRO_BATCH` to 1 (slower but less VRAM)
-- Reduce `BLOCK_SIZE` to 64
-- Remove gradient checkpointing
-
-### GPU not detected
-```python
-# Check in Python
-import torch
-print(torch.cuda.is_available())  # Should be True
-print(torch.cuda.get_device_name(0))  # GPU name
-```
-
-## 📚 References
-
-- **Mixture of Experts**: [Switch Transformers](https://arxiv.org/abs/2101.03961)
-- **GPT Architecture**: [Language Models are Unsupervised Multitask Learners](https://d4mucfpkswtq.cloudfront.net/better-language-models/language-models.pdf)
-- **Memory Optimization**: [Reducing Activation Recomputation in Large Transformer Models](https://arxiv.org/abs/2205.05198)
-- **Tokenization**: [tiktoken](https://github.com/openai/tiktoken)
-
-## 📝 License
-
-MIT License - See LICENSE file
-
----
-
-**Status**: ✅ Ready for training!
-
-Next steps:
-1. ⏳ Wait for dataset preparation (`prepare_data.py`)
-2. ▶️ Run training (`python main.py`)
-3. 🎉 Generate text (`python run.py`)
+MIT License

@@ -23,12 +23,6 @@ def load_checkpoint(path, model, optimizer, attention_type=None):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     sd = ckpt["model_state"]
 
-    # Handle weight tying: remove separate head.weight if present
-    if 'head.weight' in sd:
-        del sd['head.weight']
-    # Also handle any 'model.head.weight' key
-    sd = {k: v for k, v in sd.items() if k != 'model.head.weight'}
-
     if attention_type is not None:
         ckpt_attn = ckpt.get("attention_type", "softmax")
         if ckpt_attn != attention_type:
