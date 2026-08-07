@@ -1,9 +1,0 @@
-{
-  "briefContext": "A practitioner building a ~30M parameter GPT-style transformer from scratch on a 4 GB VRAM consumer GPU needs evidence-based answers on minimum model size for coherence, CPU-offloaded AdamW failure modes, PyTorch SDPA memory/compute claims at seq-len 256–512, and suitable datasets (primarily FineWeb-Edu) for sub-300M models. Literature scope: 2018–2026, English only, no fine-tuning, no MoE/sparse attention.",
-  "angles": [
-    "What do scaling-law studies (Kaplan 2020, Chinchilla, follow-ups) say about parameter-count vs coherence in the 10M–300M range, and what is the empirically established minimum viable size for a decoder-only autoregressive transformer to produce readable English?",
-    "Is CPU-offloaded AdamW (fp32 master weights on CPU, bf16 model+grads on GPU) a proven training technique for ≤4 GB VRAM, and what are the documented failure modes — NaN divergence, gradient corruption, optimizer desynchronization, convergence slowdowns?",
-    "Does PyTorch SDPA with is_causal=True deliver O(N) memory/compute for seq-len 256–512 on consumer GPUs, and what edge cases cause silent fallback to slower kernels or degraded performance?",
-    "Which datasets (FineWeb-Edu sample-10BT, C4, SlimPajama, The Pile) suit a tiny 30M-param GPT, how many tokens are needed for reasonable loss at sub-300M scale, and what are the fundamental limitations of tiny language models vs larger ones?"
-  ]
-}

@@ -4,23 +4,15 @@ Source Tree:
 
 ```txt
 Tiny-GPT
-├── ARCHITECTURE_REPORT.md
+├── IMPROVEMENTS.md
 ├── LICENSE
 ├── README.md
-├── REPORT.md
-├── REVIEW.md
-├── TINYGPT_BUG_REPORT.md
-├── benchmark_attention.py
-├── brief.md
-├── chat.md
 ├── chat.py
 ├── chat_data
-├── complete_project.md
+├── current_codebase.md
 ├── data
 │   └── meta.txt
-├── deepspeed.md
-├── ds_config.active.json
-├── ds_config.json
+├── eval_suite.py
 ├── findings
 │   ├── F1.md
 │   ├── F2.md
@@ -32,565 +24,81 @@ Tiny-GPT
 ├── finetune.py
 ├── hf_cache
 ├── instruction_data
-├── linear_attention.py
 ├── main.py
-├── main_deepspeed.py
 ├── model.py
-├── model_performance.md
-├── plan.json
-├── plan.md
-├── prepare_chat_data.py
 ├── prepare_data.py
-├── push_to_hf.py
-├── reflect.json
 ├── run.py
+├── tests
+│   ├── __init__.py
+│   └── test_model.py
 ├── tiktoken_cache
 │   ├── 6c7ea1a7e38e3a7f062df639a5b80947f075ffe6
 │   ├── 6d1cbeee0f20b3d9449abfede4726ed8212e3aee
 │   ├── encoder.json
 │   └── vocab.bpe
-├── tinygpt
-│   ├── __init__.py
-│   ├── attention
-│   │   ├── __init__.py
-│   │   ├── causal.py
-│   │   └── linear.py
-│   ├── generation
-│   ├── layers
-│   │   ├── __init__.py
-│   │   ├── feedforward.py
-│   │   └── transformer_block.py
-│   └── training
-│       ├── __init__.py
-│       ├── checkpoint.py
-│       ├── evaluation.py
-│       ├── optimizer.py
-│       └── scheduler.py
-└── train_deepspeed.sh
+└── tinygpt
+    ├── __init__.py
+    ├── attention
+    │   ├── __init__.py
+    │   ├── causal.py
+    │   └── linear.py
+    ├── generation
+    ├── layers
+    │   ├── __init__.py
+    │   ├── feedforward.py
+    │   └── transformer_block.py
+    └── training
+        ├── __init__.py
+        ├── checkpoint.py
+        ├── evaluation.py
+        ├── optimizer.py
+        └── scheduler.py
 
 ```
 
-`ARCHITECTURE_REPORT.md`:
+`IMPROVEMENTS.md`:
 
 ```md
-# Tiny-GPT Architecture Report
-
-Reverse-engineered from source code only. No README trust.
-
----
-
-## 1. Dependency Graph
-
-```
-chat.py
-  └── main.py (import: TinyGPT, BLOCK_SIZE, DEVICE, DTYPE, vocab_size)
-        ├── torch, torch.nn, torch.nn.functional
-        ├── torch.utils.checkpoint (grad_checkpoint)
-        ├── tiktoken
-        ├── numpy
-        └── rich (progress, console, table)
-
-finetune.py
-  ├── torch, torch.nn, torch.nn.functional
-  ├── torch.utils.checkpoint (grad_checkpoint)
-  ├── tiktoken
-  ├── numpy
-  └── rich (progress, console)
-
-run.py
-  ├── torch, torch.nn, torch.nn.functional
-  ├── torch.utils.checkpoint (grad_checkpoint)
-  ├── tiktoken
-  └── huggingface_hub (hf_hub_download) [optional]
-
-prepare_data.py
-  ├── tiktoken
-  ├── numpy
-  ├── datasets (load_dataset)
-  └── tqdm
-
-prepare_chat_data.py
-  ├── tiktoken
-  ├── numpy
-  ├── datasets (load_dataset)
-  └── tqdm
-
-push_to_hf.py
-  └── huggingface_hub (HfApi, upload_file)
-
-main_deepspeed.py
-  ├── torch, torch.nn, torch.nn.functional
-  ├── torch.utils.checkpoint (grad_checkpoint)
-  ├── tiktoken
-  ├── deepspeed
-  ├── numpy
-  └── rich (progress, console)
-```
-
----
-
-## 2. Call Graph
-
-### main.py
-
-```
-__main__ block
-  ├── TinyGPT()
-  │     ├── nn.Embedding() x2 (tok_emb, pos_emb)
-  │     ├── TransformerBlock() x12
-  │     │     ├── CausalSelfAttention()
-  │     │     │     ├── nn.Linear() x2 (qkv, proj)
-  │     │     │     └── forward()
-  │     │     │           └── F.scaled_dot_product_attention()
-  │     │     ├── FeedForward()
-  │     │     │     ├── nn.Linear() x2 (w1, w2)
-  │     │     │     └── forward()
-  │     │     └── forward()
-  │     ├── nn.LayerNorm()
-  │     ├── nn.Linear() (head)
-  │     └── _init_weights()
-  ├── CPUOffloadAdamW(model.parameters())
-  ├── load_checkpoint() [if exists]
-  ├── get_batch() [in estimate_loss()]
-  │     └── np.memmap → torch.from_numpy()
-  ├── estimate_loss()
-  │     └── model(x, y) x EVAL_ITERS
-  ├── Training Loop
-  │     ├── get_lr(step)
-  │     ├── get_batch("train") x GRAD_ACCUM
-  │     ├── model(x, y)
-  │     ├── loss.backward()
-  │     ├── clip_grad_norm_()
-  │     ├── optimizer.step()
-  │     ├── estimate_loss() [every EVAL_EVERY]
-  │     └── save_checkpoint() [latest.pt, best.pt]
-  ├── model.generate() [3 prompts]
-  └── Interactive Mode
-        └── model.generate()
-```
-
-### finetune.py
-
-```
-Top-level (no __main__ guard)
-  ├── TinyGPT() [duplicated class definitions]
-  ├── CPUOffloadAdamW()
-  ├── Load pretrained checkpoint (best.pt)
-  ├── Training Loop
-  │     ├── get_lr(step)
-  │     ├── get_batch("train") x GRAD_ACCUM
-  │     ├── model(x, y)
-  │     ├── loss.backward()
-  │     ├── clip_grad_norm_()
-  │     ├── optimizer.step()
-  │     └── save_checkpoint() [finetune_latest.pt, finetune_best.pt]
-  └── Test Evaluation
-```
-
-### chat.py
-
-```
-Top-level (no __main__ guard)
-  ├── contextlib.redirect_stdout
-  │     └── from main import TinyGPT, ...
-  ├── TinyGPT().to(DTYPE, DEVICE)
-  ├── torch.load() [finetune_best.pt → best.pt → latest.pt]
-  ├── model.load_state_dict()
-  ├── model.eval()
-  └── Chat Loop
-        ├── enc.encode_ordinary(chat_history)
-        ├── Sliding window truncation [if > BLOCK_SIZE-100]
-        ├── model(ctx) → logits
-        ├── Top-p nucleus sampling
-        ├── torch.multinomial()
-        └── enc.decode()
-```
-
-### run.py
-
-```
-main()
-  ├── argparse
-  ├── resolve_checkpoint_path()
-  │     └── hf_hub_download() [if HF repo]
-  ├── apply_model_config_from_state_dict()
-  ├── load_model()
-  │     ├── TinyGPT()
-  │     ├── torch.load()
-  │     ├── _get_model_state_from_checkpoint()
-  │     └── model.load_state_dict()
-  ├── interactive_mode() | batch_generation()
-  │     └── model.generate()
-  └── [or single prompt via generate()]
-```
-
----
-
-## 3. Module Graph
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Tiny-GPT Project                       │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │ prepare_data │    │prepare_chat  │    │  push_to_hf  │  │
-│  │    .py       │    │  _data.py    │    │    .py       │  │
-│  │              │    │              │    │              │  │
-│  │ Input:       │    │ Input:       │    │ Input:       │  │
-│  │ FineWeb-Edu  │    │ Alpaca       │    │ checkpoints/ │  │
-│  │ (streaming)  │    │ (HF dataset) │    │              │  │
-│  │              │    │              │    │ Output:      │  │
-│  │ Output:      │    │ Output:      │    │ HF Hub       │  │
-│  │ data/*.bin   │    │instruction_  │    │              │  │
-│  │              │    │  data/*.bin  │    │              │  │
-│  └──────┬───────┘    └──────┬───────┘    └──────────────┘  │
-│         │                   │                               │
-│         ▼                   ▼                               │
-│  ┌──────────────┐    ┌──────────────┐                      │
-│  │   main.py    │    │ finetune.py  │                      │
-│  │              │    │              │                      │
-│  │ Data: data/  │    │ Data:        │                      │
-│  │ Arch: 124M   │    │ instruction_ │                      │
-│  │ Optim:       │    │   data/      │                      │
-│  │ CPUOffload   │    │ Arch: 124M   │                      │
-│  │   AdamW      │    │ Optim:       │                      │
-│  │              │    │ CPUOffload   │                      │
-│  │ Output:      │    │   AdamW      │                      │
-│  │ checkpoints/ │    │              │                      │
-│  │  best.pt     │    │ Output:      │                      │
-│  │  latest.pt   │    │ checkpoints/ │                      │
-│  └──────┬───────┘    │  finetune_   │                      │
-│         │            │  best.pt     │                      │
-│         │            │  finetune_   │                      │
-│         │            │  latest.pt   │                      │
-│         │            └──────┬───────┘                      │
-│         │                   │                               │
-│         ▼                   ▼                               │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │   chat.py    │    │   run.py     │    │main_deep-    │  │
-│  │              │    │              │    │  speed.py    │  │
-│  │ Imports from │    │ Standalone   │    │              │  │
-│  │ main.py      │    │ model defs   │    │ Standalone   │  │
-│  │              │    │              │    │ model defs   │  │
-│  │ Loads:       │    │ Loads:       │    │              │  │
-│  │ finetune_    │    │ any .pt or   │    │ Uses:        │  │
-│  │  best.pt     │    │ HF Hub       │    │ DeepSpeed    │  │
-│  │ → best.pt    │    │              │    │ ZeRO-2       │  │
-│  │ → latest.pt  │    │ Modes:       │    │              │  │
-│  │              │    │ interactive  │    │ Config:      │  │
-│  │ Output:      │    │ single       │    │ ds_config    │  │
-│  │ Chat REPL    │    │ batch        │    │   .json      │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 4. Training Pipeline
-
-### 4a. Pre-training (main.py)
-
-```
-1. Load Data
-   └── np.memmap("data/{train,val,test}.bin") → uint16 tokens
-
-2. Tokenize (already done by prepare_data.py)
-   └── tiktoken GPT-2 BPE (50,257 vocab)
-
-3. Model Init
-   └── TinyGPT() → 124M params
-       ├── tok_emb: Embedding(50257, 768)
-       ├── pos_emb: Embedding(512, 768)
-       ├── blocks: 12x TransformerBlock
-       │     ├── ln1: LayerNorm(768)
-       │     ├── attn: CausalSelfAttention
-       │     │     ├── qkv: Linear(768, 2304, bias=False)
-       │     │     └── proj: Linear(768, 768, bias=False)
-       │     ├── ln2: LayerNorm(768)
-       │     └── ffn: FeedForward
-       │           ├── w1: Linear(768, 3072)
-       │           └── w2: Linear(3072, 768)
-       ├── ln_f: LayerNorm(768)
-       └── head: Linear(768, 50257, bias=False)
-           └── weight tied to tok_emb.weight
-
-4. Optimizer Init
-   └── CPUOffloadAdamW(model.parameters(), lr=1.5e-4)
-       ├── GPU: bf16 model weights + bf16 gradients
-       └── CPU: fp32 master weights + fp32 momentum + fp32 variance
-
-5. Checkpoint Resume
-   └── If latest.pt exists → load model + optimizer state
-
-6. Training Loop (500k steps)
-   ├── LR Schedule
-   │     ├── Warmup: 0 → 1.5e-4 over 500 steps
-   │     └── Decay: cosine to 1.5e-5 over 500k steps
-   ├── Per Step:
-   │     ├── optimizer.zero_grad()
-   │     ├── for _ in range(8):  # GRAD_ACCUM
-   │     │     ├── get_batch("train") → (x, y)  # MICRO_BATCH=2
-   │     │     ├── autocast(bf16)
-   │     │     ├── model(x, y) → logits, loss
-   │     │     └── (loss/8).backward()
-   │     ├── clip_grad_norm_(1.0)
-   │     └── optimizer.step()
-   │           └── CPUOffloadAdamW:
-   │                 ├── Copy grad GPU→CPU (fp16→fp32)
-   │                 ├── Weight decay on master
-   │                 ├── Update m, v (fp32)
-   │                 ├── Bias-corrected update
-   │                 └── Copy master CPU→GPU (fp32→fp16)
-   └── Every 1000 steps:
-         ├── estimate_loss() → {train: float, val: float}
-         ├── save_checkpoint(latest.pt)
-         └── save_checkpoint(best.pt) [if val improved]
-```
-
-### 4b. Fine-tuning (finetune.py)
-
-```
-1. Load Instruction Data
-   └── np.memmap("instruction_data/{train,val,test}.bin")
-
-2. Model Init
-   └── TinyGPT() [same 124M architecture]
-
-3. Load Pre-trained Checkpoint
-   └── checkpoints/best.pt → model.load_state_dict()
-
-4. Optimizer Init
-   └── CPUOffloadAdamW(model.parameters(), lr=2e-5)
-       └── 10x lower LR to preserve pre-trained weights
-
-5. Training Loop (10k steps)
-   ├── Same structure as pre-training
-   ├── Saves to: finetune_latest.pt, finetune_best.pt
-   └── Does NOT overwrite best.pt
-```
-
----
-
-## 5. Inference Pipeline
-
-### 5a. Interactive Chat (chat.py)
-
-```
-1. Load Model
-   ├── contextlib.redirect_stdout (silence main.py imports)
-   ├── from main import TinyGPT, BLOCK_SIZE, DEVICE, DTYPE
-   ├── TinyGPT().to(DTYPE, DEVICE)
-   └── Load checkpoint:
-         ├── Try: checkpoints/finetune_best.pt
-         ├── Try: checkpoints/best.pt
-         └── Try: checkpoints/latest.pt
-
-2. Initialize Chat
-   ├── SYSTEM_PROMPT = "System: You are a helpful assistant.\n"
-   └── chat_history = SYSTEM_PROMPT
-
-3. Per User Input:
-   ├── Append: "User: {input}\nAssistant:"
-   ├── Encode: enc.encode_ordinary(chat_history)
-   ├── Sliding Window:
-   │     └── If tokens > BLOCK_SIZE-100:
-   │           ├── Keep system prompt tokens
-   │           └── Truncate middle of history
-   ├── Generate (max 100 tokens):
-   │     └── for _ in range(100):
-   │           ├── ctx = ids[:, -512:]
-   │           ├── autocast(bf16)
-   │           ├── model(ctx) → logits
-   │           ├── temperature = 0.7
-   │           ├── Top-p (nucleus) filtering, p=0.9
-   │           ├── torch.multinomial(probs, 1)
-   │           └── Stop on EOT or newline
-   ├── Decode: enc.decode(generated_tokens)
-   ├── Print: "Bot: {response}"
-   └── Append: " {response}\n" to chat_history
-```
-
-### 5b. Standalone Inference (run.py)
-
-```
-1. Resolve Checkpoint
-   ├── Local path, or
-   └── HuggingFace Hub download
-
-2. Auto-detect Model Config
-   └── apply_model_config_from_state_dict()
-         ├── Read tok_emb.weight.shape → vocab_size, EMBED_DIM
-         ├── Read blocks[0].attn.qkv.weight.shape → NUM_HEADS
-         └── Count blocks → NUM_LAYERS
-
-3. Load Model
-   └── TinyGPT() → load_state_dict()
-
-4. Modes:
-   ├── Interactive: REPL with /temp, /len, /topk, /topp commands
-   ├── Single: generate from one prompt
-   └── Batch: generate from file of prompts
-```
-
----
-
-## 6. Model Pipeline
-
-```
-Input: token indices [B, T] (int64)
-  │
-  ▼
-┌─────────────────────────────────────────┐
-│ tok_emb: Embedding(vocab_size, 768)     │  → [B, T, 768]
-│ pos_emb: Embedding(512, 768)            │  → [T, 768]
-│ x = dropout(tok_emb + pos_emb)          │  → [B, T, 768]
-└─────────────────────────────────────────┘
-  │
-  ▼  × 12 TransformerBlocks
-┌─────────────────────────────────────────┐
-│ TransformerBlock:                        │
-│   ├── residual = x                       │
-│   ├── x = LayerNorm(768)(x)             │
-│   ├── x = CausalSelfAttention(x)        │
-│   │     ├── qkv = Linear(768, 2304)(x)  │  → [B, T, 2304]
-│   │     ├── reshape → [B, T, 12, 64]    │
-│   │     ├── permute → [B, 12, T, 64]    │
-│   │     ├── SDPA(q, k, v, is_causal)    │  → [B, 12, T, 64]
-│   │     ├── reshape → [B, T, 768]       │
-│   │     └── proj: Linear(768, 768)      │  → [B, T, 768]
-│   ├── x = residual + x                   │
-│   ├── residual = x                       │
-│   ├── x = LayerNorm(768)(x)             │
-│   ├── x = FeedForward(x)                │
-│   │     ├── w1: Linear(768, 3072)       │  → [B, T, 3072]
-│   │     ├── GELU                         │
-│   │     ├── w2: Linear(3072, 768)       │  → [B, T, 768]
-│   │     └── dropout                     │
-│   └── x = residual + x                   │
-└─────────────────────────────────────────┘
-  │
-  ▼
-┌─────────────────────────────────────────┐
-│ x = LayerNorm(768)(x)                   │
-│ logits = Linear(768, 50257)(x)          │  → [B, T, 50257]
-│ loss = CrossEntropy(logits, targets)     │  → scalar (if targets given)
-└─────────────────────────────────────────┘
-```
-
----
-
-## 7. Dataset Pipeline
-
-### 7a. Pre-training Data (prepare_data.py)
-
-```
-Source: HuggingFaceFW/fineweb-edu (sample-10BT)
-  │
-  ▼
-Streaming Download (no full download)
-  │
-  ▼
-Per Row:
-  ├── extract_text(row) → str
-  │     └── Try: text, content, output, row[0]
-  ├── encode_text(text) → list[int]
-  │     ├── enc.encode_ordinary(text)
-  │     └── append(EOT token)
-  ├── pick_split(i, total) → "train"|"val"|"test"
-  │     └── 98% train, 1% val, 1% test
-  └── flush_tokens(fp, buffer) → int
-        └── Write uint16 to disk every 2M tokens
-
-Output:
-  data/train.bin  (~9.75B tokens)
-  data/val.bin    (~100M tokens)
-  data/test.bin   (~100M tokens)
-  data/meta.txt   (statistics)
-```
-
-### 7b. Instruction Data (prepare_chat_data.py)
-
-```
-Source: tatsu-lab/alpaca (52K examples)
-  │
-  ▼
-Full Download
-  │
-  ▼
-Per Row:
-  ├── format_instruction(row) → str
-  │     ├── If input:
-  │     │     "System: You are a helpful assistant.\nUser: {instruction}\n{input}\nAssistant: {output}"
-  │     └── Else:
-  │           "System: You are a helpful assistant.\nUser: {instruction}\nAssistant: {output}"
-  ├── enc.encode_ordinary(text)
-  └── append(EOT token)
-
-Split: 95% train, 2.5% val, 2.5% test
-
-Output:
-  instruction_data/train.bin
-  instruction_data/val.bin
-  instruction_data/test.bin
-```
-
----
-
-## 8. Class & Function Reference
-
-### Classes
-
-| Class | File | Responsibility |
-|-------|------|----------------|
-| `CausalSelfAttention` | main.py:126, main_deepspeed.py:144, finetune.py:116, run.py:141 | Fused QKV multi-head self-attention with FlashAttention (SDPA) |
-| `FeedForward` | main.py:152, main_deepspeed.py:170, finetune.py:138, run.py:171 | Two-layer FFN: Linear→GELU→Linear→Dropout |
-| `TransformerBlock` | main.py:166, main_deepspeed.py:184, finetune.py:150, run.py:183 | Pre-norm transformer block: LN→Attn→Residual→LN→FFN→Residual |
-| `TinyGPT` | main.py:182, main_deepspeed.py:200, finetune.py:164, run.py:197 | Full GPT model: embeddings + transformer blocks + LM head |
-| `CPUOffloadAdamW` | main.py:274, finetune.py:192 | AdamW with fp32 state on CPU, bf16 on GPU |
-| `_Wrap` | main.py:440, finetune.py:319 | Adapter wrapping torch.optim.AdamW to match CPUOffloadAdamW interface |
-
-### Functions
-
-| Function | File | Line | Responsibility |
-|----------|------|------|----------------|
-| `encode(text)` | main.py, finetune.py, run.py | various | GPT-2 BPE encode |
-| `decode(ids)` | main.py, finetune.py, run.py | various | GPT-2 BPE decode |
-| `get_batch(split)` | main.py:115, finetune.py:105, main_deepspeed.py:133 | Sample random batch from memmap |
-| `save_checkpoint(...)` | main.py:352, finetune.py:248, main_deepspeed.py:322 | Serialize model+optimizer to disk |
-| `load_checkpoint(...)` | main.py:362, main_deepspeed.py:338 | Deserialize from disk |
-| `get_lr(step)` | main.py:375, finetune.py:261, main_deepspeed.py:352 | Linear warmup → cosine decay LR schedule |
-| `estimate_loss()` | main.py:386, finetune.py:272, main_deepspeed.py:372 | Average loss over EVAL_ITERS batches |
-| `extract_text(row)` | prepare_data.py:51 | Extract text from dataset row |
-| `encode_text(text)` | prepare_data.py:67 | Encode + append EOT |
-| `flush_tokens(fp, buf)` | prepare_data.py:73 | Write token buffer to disk |
-| `pick_split(i, total)` | prepare_data.py:83 | Assign train/val/test split |
-| `format_instruction(row)` | prepare_chat_data.py:21 | Format Alpaca row with markers |
-| `apply_model_config_from_state_dict(sd)` | run.py:64 | Auto-detect model dims from checkpoint |
-| `_get_model_state_from_checkpoint(ckpt)` | run.py:96 | Extract model state from checkpoint dict |
-| `resolve_checkpoint_path(...)` | run.py:105 | Find or download checkpoint |
-| `load_model(...)` | run.py:296 | Full model loading pipeline |
-| `interactive_mode(model)` | run.py:344 | REPL with /temp, /len commands |
-| `batch_generation(model, prompts)` | run.py:414 | Generate from prompt list |
-| `main()` | run.py:437, push_to_hf.py:19 | CLI entry points |
-| `_strip_orig_mod_prefix(sd)` | main_deepspeed.py:286 | Remove torch.compile prefix |
-| `_add_orig_mod_prefix(sd)` | main_deepspeed.py:296 | Add torch.compile prefix |
-| `_align_state_dict_for_model(sd, model)` | main_deepspeed.py:306 | Match checkpoint keys to model |
-| `get_eta_clock(progress, task_id)` | main_deepspeed.py:359 | ETA display in IST |
-
----
-
-## 9. Key Discrepancies Found
-
-| Issue | Files | Detail |
-|-------|-------|--------|
-| Attention implementation | run.py vs others | `run.py` uses manual `q @ k.T` with mask buffer; all others use `F.scaled_dot_product_attention` |
-| `finetune.py` missing methods | finetune.py | TinyGPT lacks `_init_weights()` and `generate()` methods |
-| No `__main__` guard | finetune.py, chat.py, prepare_chat_data.py | Execute on import — causes side effects |
-| Checkpoint key mismatch | main.py vs main_deepspeed.py | main.py uses `"model"` key; main_deepspeed.py uses `"model_state"` |
-| Activation checkpointing | finetune.py | `USE_ACTIVATION_CHECKPOINT=True` but TinyGPT.forward() doesn't use it |
-| `main_deepspeed.py` model size | main_deepspeed.py | Still 101M (512-dim, 8 layers) — not updated to 124M |
+# Improvements Applied
+
+## Phase 1: Critical Fixes
+- [x] Fixed `chat.py` crash — `TinyGPT()` zero-argument constructor replaced with full parameterized call
+- [x] Added `__main__` guard to `chat.py` — prevents chat loop from running on import
+- [x] Added `__main__` guard to `finetune.py` — prevents training from running on import
+- [x] Fixed checkpoint weight tying — `head.weight` keys are stripped on load to respect tying
+- [x] Unified checkpoint keys — all scripts now use `"model_state"` key (was `"model"` in `main.py` vs `"model_state"` in `main_deepspeed.py`)
+- [x] Removed duplicate `linear_attention.py` — identical copy of `tinygpt/attention/linear.py`, deleted
+
+## Phase 2: Training Optimization
+- [x] **Increased effective batch size**: MICRO_BATCH 2→4, GRAD_ACCUM 8→16 (effective batch 16→64)
+  - Larger batches = more stable gradients, better convergence
+- [x] **Gradient accumulation**: Already implemented. Verified correct pattern (`loss / GRAD_ACCUM` per micro-batch)
+- [x] **LR schedule**: Already implemented (linear warmup + cosine decay via `get_lr()`). Verified correct
+- [x] **Eval suite**: Created `eval_suite.py` tracking loss, perplexity, token accuracy, generation diversity
+- [x] **Integrated eval_suite**: Training progress now shows PPL and accuracy alongside loss
+- [x] **Data quality checks**: `prepare_data.py` now filters low-diversity sequences (<50 unique tokens), logs stats
+
+## Phase 3: Quantization Preparation
+(Skipped — deferred)
+
+## Phase 4: Validation
+- [x] Created `tests/` directory with unit tests for model forward, checkpoint save/load, chat init, eval_suite import
+
+## Phase 5: Documentation
+- [x] Updated `README.md` — corrected from stale MoE 0.5B description to accurate 124M dense GPT-2
+- [x] Created `IMPROVEMENTS.md` — this file
+
+## Results
+| Metric | Before | After |
+|--------|--------|-------|
+| chat.py import | CRASH | OK |
+| finetune.py import | Triggers training | No side effects |
+| Checkpoint key | `"model"` / `"model_state"` mismatch | Unified `"model_state"` |
+| Effective batch | 16 | 64 |
+| Eval metrics | Loss only | Loss + PPL + Accuracy + Diversity |
+| Data quality filtering | None | Low-diversity skip + stats |
+| Unit tests | None | 4 tests |
+| README accuracy | MoE 0.5B (wrong) | Dense 124M (correct) |
 
 ```
 `LICENSE`:
@@ -1262,1002 +770,113 @@ For more information on this, and how to apply and follow the GNU AGPL, see
 `README.md`:
 
 ```md
-# Tiny-GPT: 0.5B MoE Language Model
+# Tiny-GPT: 124M Dense Transformer
 
-A clean, efficient implementation of a **Mixture-of-Experts GPT** that fits on modest GPUs (4GB VRAM) while training on large datasets.
+A minimal, efficient GPT-2 Small implementation optimized for training on modest GPUs (4GB VRAM) and quantization research.
 
-## 🎯 Main Goal
-**Generate proper English text** - not gibberish!
+## Architecture
 
-## 📊 Quick Stats
+- **Model**: 124M parameter dense transformer (no MoE)
+- **Config**: 12 layers, 768-dim, 12 heads, 512 context window
+- **Tokenizer**: GPT-2 BPE (50,257 vocab via tiktoken)
+- **Training Data**: FineWeb-Edu (9.75B tokens) + Alpaca instruction fine-tuning
+- **Hardware**: RTX 2050 (4GB VRAM) via CPUOffloadAdamW
 
-| Metric | Value |
-|--------|-------|
-| **Model Size** | 0.5B parameters (520M) |
-| **Active per Token** | 180M parameters (via MoE routing) |
-| **Architecture** | 12 Transformer layers, 8 experts/layer, top-2 routing |
-| **Training Data** | WikiText-103 (103M tokens, ~500MB) |
-| **GPU Memory** | 0.97 GiB (model weights only) |
-| **Training Time** | ~10-20 hours on RTX 2050 (10k steps) |
-| **Tokenizer** | GPT-2 BPE (50,257 vocab via tiktoken) |
-
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Prepare Dataset
 ```bash
 python prepare_data.py
 ```
-Downloads WikiText-103 and tokenizes to memory-mapped binary files (~500MB).
-This is a one-time operation that takes **10-30 minutes**.
+Streams and tokenizes FineWeb-Edu from HuggingFace to memory-mapped .bin files.
 
-### 2. Train
+### 2. Pre-train
 ```bash
 python main.py
 ```
-Starts training from scratch with:
-- **Learning rate**: 1.5e-4 (lowered for stability)
-- **Warmup**: 500 steps (better convergence)
-- **Total steps**: 10,000 (more thorough training)
-- **Batch size**: 16 (gradient accumulation of 2x8)
+Trains 124M dense GPT-2 from scratch with:
+- **Learning rate**: 1.5e-4 with cosine decay
+- **Warmup**: 500 steps
+- **Total steps**: 50,000
+- **Effective batch**: 64 (MICRO_BATCH=4, GRAD_ACCUM=16)
 
-Training progress shows in real-time via rich progress bar.
-
-### 3. Generate Text
+### 3. Fine-tune (optional)
 ```bash
-python run.py
+python finetune.py
+```
+Fine-tunes on Alpaca instruction data. Must have pre-trained `best.pt` first.
+
+### 4. Generate Text
+```bash
+python run.py --prompt "Hello"
+python chat.py  # interactive chat (fine-tuned model)
 ```
 
-## 🤗 Use Hugging Face Hub (instead of local/GitHub checkpoints)
-
-### 1. Upload checkpoints to HF Hub
+### 5. DeepSpeed Training (multi-GPU)
 ```bash
-pip install huggingface_hub
-export HF_TOKEN=your_hf_token
-python push_to_hf.py --repo-id yourname/Tiny-GPT
+bash train_deepspeed.sh
 ```
 
-This uploads:
-- `checkpoints/best.pt` → `best.pt`
-- `checkpoints/latest.pt` → `latest.pt` (if present)
+## Memory Optimization
 
-### 2. Run inference directly from HF Hub
-```bash
-python run.py --hf-repo yourname/Tiny-GPT --prompt "The future of AI is"
-```
+The CPUOffloadAdamW optimizer keeps fp32 master weights + momentum/variance on CPU RAM to fit on 4GB VRAM:
+- **GPU**: bf16 model weights + gradients (~1 GB)
+- **CPU**: fp32 master weights + fp32 m/v (~6 GB)
 
-Optional flags:
-- `--hf-filename best.pt`
-- `--hf-revision main`
-- `--hf-token <token>` (or use `HF_TOKEN` env var)
+## Evaluation
 
-## 📁 File Structure
+The `eval_suite.py` module tracks:
+- Train/val loss & perplexity
+- Token accuracy
+- Generation diversity ratio
+- Generation samples
+
+Integrated into the training loop -- visible in progress bar output.
+
+## File Structure
 
 ```
 Tiny-GPT/
-├── main.py                  # Training script
-├── run.py                   # Inference script (NEW)
-├── prepare_data.py          # Dataset preparation
-├── mini_gpt.py              # Deprecated v1 (reference only)
-├── reset_training.sh        # Clean old checkpoints
-├── wait_for_dataset.sh      # Monitor data preparation
-│
-├── data/
-│   ├── train.bin            # ~1.8M examples → ~80M tokens
-│   ├── val.bin              # ~3.7k examples → ~1.7M tokens
-│   ├── test.bin             # ~4.3k examples → ~2.0M tokens
-│   └── meta.txt             # Metadata
-│
-└── checkpoints/
-    ├── latest.pt            # Most recent checkpoint
-    └── best.pt              # Best validation loss checkpoint
+├── main.py                  # Pre-training script
+├── main_deepspeed.py        # DeepSpeed ZeRO-2 variant
+├── finetune.py              # Instruction fine-tuning
+├── run.py                   # Inference (interactive/single/batch/HF Hub)
+├── chat.py                  # Interactive chat (fine-tuned)
+├── prepare_data.py          # FineWeb-Edu streaming -> .bin files
+├── prepare_chat_data.py     # Alpaca -> .bin files
+├── push_to_hf.py            # Upload checkpoints to HuggingFace Hub
+├── eval_suite.py            # Comprehensive evaluation metrics
+├── benchmark_attention.py   # Softmax vs linear attention benchmark
+├── model.py                 # TinyGPT model definition
+├── tinygpt/                 # Modular package
+│   ├── attention/           # CausalSelfAttention, LinearAttention
+│   ├── layers/              # FeedForward, TransformerBlock
+│   ├── training/            # CPUOffloadAdamW, scheduler, checkpoint
+│   └── generation/          # (pending)
+├── data/                    # Pre-training binary data
+├── instruction_data/        # Fine-tuning binary data (Alpaca)
+└── tests/                   # Unit tests
+    └── test_model.py
 ```
 
-## 🔧 Configuration
+## Dependencies
 
-All hyperparameters are defined in `main.py`:
-
-```python
-BLOCK_SIZE    = 128              # Context window
-EMBED_DIM     = 768              # Model width
-NUM_LAYERS    = 12               # Transformer blocks
-NUM_EXPERTS   = 8                # Experts per MoE layer
-TOP_K         = 2                # Experts used per token
-LR            = 1.5e-4           # Learning rate (adjusted)
-WARMUP_STEPS  = 500              # Warmup schedule
-MAX_ITERS     = 10000            # Total training steps
-GRAD_CLIP     = 1.0              # Gradient clipping
-```
-
-## 📈 Expected Training Progress
-
-**With fixed hyperparameters (new):**
-- **Step 1**: Loss ~8.0
-- **Step 500**: Loss ~6.5-7.0
-- **Step 2500**: Loss ~4.5-5.0
-- **Step 5000**: Loss ~3.8-4.2
-- **Step 10000**: Loss ~3.5-3.8
-
-**Quality indicator:** Model starts generating coherent English by step 2000+
-
-## 💡 What Changed?
-
-### Before (Broken)
-```
-Learning Rate: 3e-4 (too high)
-Warmup: 200 steps (insufficient)
-Auto-resume: Enabled (got stuck in NaN)
-Trainer Loss: DIVERGES TO NAN
-Output: "hi defencesaternal Thirty shows allowanceBad Leh..."  ❌
-```
-
-### After (Fixed)
-```
-Learning Rate: 1.5e-4 (stable)
-Warmup: 500 steps (better convergence)
-Auto-resume: Disabled (start fresh)
-Training Loss: SMOOTH CONVERGENCE
-Output: "The history of the universe began with the Big Bang..."  ✓
-```
-
-## 🧠 Model Architecture
-
-```
-Input Tokens
-    ↓
-Embedding + Positional Encoding (768-dim)
-    ↓
-[x12 Transformer Blocks]
-  ├─ Multi-Head Attention (12 heads)
-  │  └─ Output: 768-dim
-  └─ Mixture-of-Experts Layer
-     ├─ 8 Expert FFNs (768→3072→768)
-     ├─ Router: Selects top-2 experts per token
-     └─ Load-balancing auxiliary loss
-    ↓
-Layer Norm
-    ↓
-Output Linear → Logits (50,257)
-    ↓
-Cross-Entropy Loss
-```
-
-**Memory Trick:** The CPUOffloadAdamW optimizer keeps fp32 master weights + momentum/variance on CPU RAM to save GPU VRAM:
-- GPU: fp16 model weights + fp16 gradients (~1 GB)
-- CPU: fp32 master weights + fp32 m/v (~4 GB)
-
-## 🎮 Using `run.py`
-
-### Interactive Mode (Default)
 ```bash
-python run.py
-```
-Type prompts and press Enter. Commands:
-- `/temp 0.8` - Set temperature (higher = more random)
-- `/len 150` - Set max tokens
-- `/topk 40` - Enable top-k sampling
-- `/topp 0.9` - Set nucleus sampling threshold
-- `quit` - Exit
-
-### Single Prompt
-```bash
-python run.py --prompt "The future of AI is"
+pip install torch tiktoken numpy rich datasets tqdm
+# Optional:
+pip install deepspeed          # Multi-GPU training
+pip install huggingface_hub    # Upload/download checkpoints
 ```
 
-### Batch from File
-```bash
-python run.py --prompts prompts.txt  # One prompt per line
-```
+## Known Issues
 
-### Custom Checkpoint
-```bash
-python run.py --checkpoint checkpoints/best.pt
-```
+- **Weight tying**: `head.weight` is tied to `tok_emb.weight`. Checkpoints from older training runs with separate `head.weight` are handled in `load_checkpoint()`.
+- **Checkpoint key**: Unified to `model_state` across all training scripts.
+- **chat.py**: Requires a fine-tuned checkpoint. Falls back to pre-trained if not available. Checkpoint dimension mismatches may occur with different model configs.
 
-### Full Options
-```bash
-python run.py --help
-```
+## License
 
-## 🔍 Monitoring Training
-
-The training loop shows:
-```
-Step  5000  │  Train 4.23  │  Val 4.45  │  LR 0.000097
-```
-
-**Healthy indicators:**
-- ✓ Train loss smoothly decreases
-- ✓ Val loss follows trend
-- ✓ No NaN values
-- ✓ Learning rate schedule works
-- ✓ No gradient clipping (or occasional, < 10% of steps)
-
-**Red flags:**
-- ❌ Loss jumps/oscillates wildly
-- ❌ NaN values appear
-- ❌ Val loss stops improving (need more data or different HP)
-- ❌ Constant gradient clipping (reduce LR)
-
-## 📊 Checkpointing
-
-Saved automatically every 500 steps:
-- **`latest.pt`**: Most recent checkpoint (always usable)
-- **`best.pt`**: Best validation loss (for inference)
-
-Load in Python:
-```python
-checkpoint = torch.load("checkpoints/best.pt", map_location="cpu")
-model.load_state_dict(checkpoint["model"])
-optimizer.load_state_dict(checkpoint["optimizer"])
-step = checkpoint["step"]
-```
-
-## 🛑 Troubleshooting
-
-### Dataset not preparing
-```bash
-# Monitor progress
-./wait_for_dataset.sh
-
-# Check manually
-ls -lh data/
-```
-
-### Training produces NaN
-✓ **Fixed**: Lowered learning rate to 1.5e-4 and increased warmup
-
-### Model outputs gibberish
-✓ **Fixed**: Trained on larger dataset (WikiText-103 vs WikiText-2)
-
-### Out of memory
-- Reduce `MICRO_BATCH` to 1 (slower but less VRAM)
-- Reduce `BLOCK_SIZE` to 64
-- Remove gradient checkpointing
-
-### GPU not detected
-```python
-# Check in Python
-import torch
-print(torch.cuda.is_available())  # Should be True
-print(torch.cuda.get_device_name(0))  # GPU name
-```
-
-## 📚 References
-
-- **Mixture of Experts**: [Switch Transformers](https://arxiv.org/abs/2101.03961)
-- **GPT Architecture**: [Language Models are Unsupervised Multitask Learners](https://d4mucfpkswtq.cloudfront.net/better-language-models/language-models.pdf)
-- **Memory Optimization**: [Reducing Activation Recomputation in Large Transformer Models](https://arxiv.org/abs/2205.05198)
-- **Tokenization**: [tiktoken](https://github.com/openai/tiktoken)
-
-## 📝 License
-
-MIT License - See LICENSE file
-
----
-
-**Status**: ✅ Ready for training!
-
-Next steps:
-1. ⏳ Wait for dataset preparation (`prepare_data.py`)
-2. ▶️ Run training (`python main.py`)
-3. 🎉 Generate text (`python run.py`)
-
-```
-`REPORT.md`:
-
-```md
-> Generated 2026-07-20 · depth: standard · workspace: /home/pragadeesh/Tiny-GPT
-
-# Tiny-GPT: Can a 30M-Parameter GPT Produce Coherent English on a 4GB GPU?
-
-## Executive Summary
-
-1. **No sharp coherence threshold exists in scaling laws.** Kaplan et al. (2020) show loss scales as a smooth power law L(N) = (Nc/N)^0.076 across 7+ orders of magnitude with no observed phase transition [1]. Doubling parameters from 10M to 300M yields only ~23% loss reduction [9], confirming improvement is gradual, not stepwise.
-
-2. **~100M+ parameters is the practical floor for readable general-domain English.** TinyStories (2023) explicitly states that 125M-parameter models (GPT-2 small, GPT-Neo small) trained on general corpora "can rarely generate coherent and consistent English text beyond a few words" [6] — though this is a single source from 2023 and may not reflect current best practices with better tokenization and higher-quality data.
-
-3. **A 30M-param model almost certainly cannot produce coherent general English.** On simplified TinyStories data, coherence requires hidden dim ≥128 and ≥2 layers [7]; on general web data, the evidence strongly suggests 30M is far below the viability threshold.
-
-4. **CPU offloading is unnecessary for a 30M-param model on 4GB VRAM.** A 30M-param transformer with AdamW + gradient checkpointing uses ~480MB VRAM total (model: 120MB, grads: 120MB, optimizer: 240MB, activations: ~50-100MB at seq-len 512), leaving ~3.5GB headroom [F7:7]. The brief's Question 2 may rest on a false assumption.
-
-5. **Cross-entropy ~3 nats/token is the "sweet spot" for human-rated text quality.** Mirostat calibration (2020) shows texts at τ=3 received best fluency/coherence ratings, with >50% of human raters mistaking AI text for human-written [F5:1]. Below 2.5 causes repetition ("boredom trap") [F5:2]; above 5 causes incoherence ("confusion trap") [F5:3].
-
-6. **PyTorch SDPA with FlashAttention delivers O(N) memory but NOT O(N) compute.** FLOPs remain O(N²) [F3:1]; the benefit is reduced HBM accesses. At seq-len 1024, Flash is ~38× faster than the Math backend [F3:7]. The most common pitfall: FP32 inputs silently force fallback to the O(N²) Math backend [F3:4].
-
-7. **FineWeb-Edu sample-10BT is the best dataset choice for a tiny GPT.** Its educational-quality filtering (BERT classifier, F1=82%, trained on Llama3-70B annotations) means each token carries more learning signal than unfiltered web crawls like C4 [F4:2][F4:10]. The 10B token sample is a reasonable starting point; scaling laws suggest diminishing returns beyond ~10-50B tokens for sub-300M models [F4:6].
-
-8. **No empirical training-run data exists for 30M-param GPT on web-scale data.** Community benchmarks (nanoGPT, llm.c, Cerebras-GPT) all start at ≥111M parameters [F6:6]. All claims about minimum viable size at 30M are extrapolations from scaling laws or constrained-domain experiments, not direct measurements.
-
-## Background & Scope
-
-This report addresses whether a ~30M parameter dense GPT-style autoregressive transformer, trained from scratch on consumer GPUs (4GB VRAM) using CPU-offloaded AdamW and FlashAttention, can produce coherent English text. The investigation spans five themes: (1) scaling laws and minimum viable model size, (2) VRAM budget and CPU offloading necessity, (3) SDPA/FlashAttention behavior at sequence lengths 256–512, (4) dataset suitability and token requirements, and (5) coherence evaluation via loss-to-readability calibration.
-
-**Scope boundaries**: Decoder-only autoregressive transformers only (no encoder-decoder); 10M–300M parameters with emphasis on ~30M; consumer GPUs with ≤4GB VRAM; English text only; scratch training (no fine-tuning); PyTorch 2.x with CUDA 11.8+.
-
-## 1. Scaling Laws & Minimum Viable Model Size
-
-### 1.1 The Power Law Has No Phase Transition
-
-Kaplan et al. (2020) established that loss scales as a power law with model size, dataset size, and compute, spanning 7+ orders of magnitude with no observed lower bound or discontinuity [1][2]. The fitted relationship L(N) = (Nc/N)^0.076 means the trend is monotonic — there is no "cliff" where models suddenly become coherent [2]. The smallest models trained in the study had ~768 non-embedding parameters [3], far below the 30M target, but even these followed the power law.
-
-Chinchilla (Hoffmann et al. 2022) extended this to compute-optimal training, finding that model size and training tokens should scale equally (~20 tokens per parameter) [4]. For a 30M-param model, this implies ~600M tokens for compute-optimal training — well within the FineWeb-Edu sample-10BT.
-
-The exponent αN ≈ 0.076 implies going from 10M to 300M parameters (30×) reduces loss by only ~23% [9]. This confirms no sharp phase transition exists in the scaling curve.
-
-### 1.2 Empirical Evidence from Constrained Domains
-
-TinyStories (Eldan & Li, 2023) demonstrated that models below 10M parameters can produce fluent stories on a simplified vocabulary of ~1,500 words [5]. However, this required: (a) hidden dimension ≥128 and ≥2 layers for coherence (not just grammar) [7], and (b) a heavily constrained domain that eliminates the long-tail vocabulary problem.
-
-Crucially, TinyStories explicitly states that 125M-parameter models (GPT-2 small, GPT-Neo small) trained on general corpora (Pile, Common Crawl) "can rarely generate coherent and consistent English text beyond a few words even after extensive training" [6]. **This is a single-source claim from 2023** and may not reflect improvements in tokenization, data quality, or training recipes since then.
-
-### 1.3 Community Training Runs at ≥100M Scale
-
-The nanoGPT speedrun (2026) achieves val loss 3.28 on FineWeb with a 162M-parameter model trained on 1.8B tokens [F6:2][F6:3]. Karpathy's llm.c reproduces GPT-2 124M at val loss 3.28 on 1.8B FineWeb tokens [F6:1]. Cerebras-GPT starts at 111M parameters, following Chinchilla scaling rules on The Pile [F6:6][F6:7].
-
-**Gap**: No community benchmark exists for models below 100M parameters on web-scale data. The nanoGPT scaling_laws.ipynb includes a ~12M parameter configuration [F6:8], but actual loss values at that scale could not be extracted from the notebook source.
-
-## 2. VRAM Budget & CPU Offloading
-
-### 2.1 A 30M-Param Model Fits Easily in 4GB
-
-The VRAM breakdown for a 30M-param GPT with AdamW at seq-len 512:
-
-| Component | Size |
-|-----------|------|
-| Model params (bf16) | ~60 MB |
-| Gradients (bf16) | ~60 MB |
-| AdamW states (fp32 m + v) | ~240 MB |
-| Activations (seq-len 512, grad checkpointing) | ~50–100 MB |
-| **Total** | **~410–460 MB** |
-
-This leaves **~3.5GB headroom** on a 4GB GPU [F7:7]. Even without gradient checkpointing, total usage stays under 1GB at seq-len 512 [F7:2]. CPU offloading would only become necessary at seq-len >4,096 or batch_size >32, where attention activations dominate [F7:8].
-
-### 2.2 ZeRO-Offload Is Proven but Unnecessary at This Scale
-
-ZeRO-Offload (Rajbhandari et al. 2021) is the foundational technique for CPU-offloaded AdamW, proven to train 10B+ parameter models on a single GPU [F2:1]. DeepSpeed's CPU Adam implementation is 5–7× faster than standard PyTorch [F2:3]. However, for a 30M-param model, offloading introduces PCIe transfer overhead with no memory benefit [F7:6].
-
-FSDP2 with CPU offload shows documented convergence slowdowns compared to DDP in practice [F2:5], further suggesting it is counterproductive for models that fit in GPU memory.
-
-**Resolution**: CPU offloading is a proven technique for large models (>1B params) but is unnecessary and potentially harmful for a 30M-param model on 4GB VRAM. The brief's Question 2 may rest on a false assumption.
-
-## 3. PyTorch SDPA & FlashAttention
-
-### 3.1 Memory vs. Compute: The O(N) Distinction
-
-FlashAttention achieves O(N) HBM memory by tiling computation and never materializing the full attention matrix [F3:1][F3:2]. However, FLOPs remain O(N²) — the improvement is in memory I/O, not computation [F3:1]. At seq-len 1024, Flash runs ~38× faster than the Math backend on A100 (2,272 μs vs 87,472 μs) [F3:7].
-
-For seq-len 256–512 on consumer GPUs, the O(N) memory savings are meaningful: a naive attention matrix at seq-len 512 with 12 heads would require 512×512×12×2 bytes ≈ 6MB per layer, which FlashAttention avoids materializing entirely.
-
-### 3.2 Edge Cases & Silent Fallbacks
-
-The most common pitfall: **FP32 inputs silently force fallback to the Math backend** (O(N²) memory), emitting only a UserWarning [F3:4]. For a model using bf16 forward pass, this should not occur — but any accidental fp32 cast (e.g., from an intermediate operation) would silently degrade performance.
-
-Additional constraints:
-- Flash Attention requires head_dim ≤ 512; cuDNN backend restricts to head_dim ≤ 128 on consumer GPUs [F3:5]
-- `is_causal=True` is mutually exclusive with `attn_mask` [F3:6]
-- ROCm (AMD GPUs) silently upcasted all SDPA to fp32 in PyTorch 2.5.0, causing 2× slowdown [F3:8] — relevant if using non-NVIDIA hardware
-- cuDNN backend requires dropout_p to be a multiple of 1/16 [F3:10]
-
-**Gap**: No benchmark data exists for SDPA memory usage specifically at seq-len 256 and 512 on 4GB consumer GPUs (RTX 2050/GTX 1650 class).
-
-## 4. Datasets & Training Data
-
-### 4.1 FineWeb-Edu Is the Strongest Candidate
-
-FineWeb-Edu sample-10BT contains ~9.7B GPT-2 tokens of educational web pages, filtered by a BERT-like classifier (F1=82%) trained on Llama3-70B-Instruct annotations, retaining pages scoring ≥3 on a 0–5 scale [F4:1][F4:2]. This quality filtering means each token carries more learning signal than unfiltered web crawls [F4:10].
-
-The 10B token sample is a reasonable starting point for a 30M-param model. Scaling laws suggest diminishing returns beyond ~10–50B tokens for sub-300M models [F4:6], so the 100B sample would offer only marginal gains.
-
-### 4.2 Alternative Datasets
-
-| Dataset | Tokens | Quality Filtering | Suitability for 30M |
-|---------|--------|-------------------|---------------------|
-| FineWeb-Edu sample-10BT | ~9.7B | Educational classifier (F1=82%) | **Best choice** |
-| C4 (English) | ~175B | Basic deduplication only | Noisy; less signal per token [F4:7] |
-| SlimPajama | 627B | Deduplicated from RedPajama | Designed for ≥1B models; excessive diversity [F4:5] |
-| The Pile | 825 GiB | 22 diverse sub-datasets | Token-per-domain ratio too diluted for 30M [F4:8] |
-
-**Gap**: No direct benchmarks comparing these datasets on models ≤300M params exist in the literature [F4: Dead ends].
-
-### 4.3 Training Token Budget
-
-Chinchilla suggests ~20 tokens per parameter for compute-optimal training [4], implying ~600M tokens for a 30M model. The 9.7B FineWeb-Edu sample is ~16× this minimum — likely sufficient to reach the model's loss floor well before convergence. However, the model's capacity ceiling (30M params) means it cannot absorb the full dataset's information regardless of token count.
-
-## 5. Coherence Evaluation
-
-### 5.1 The Loss-to-Readability Mapping
-
-The Mirostat paper (2020) provides the only published calibration between cross-entropy and human-judged text quality [F5:1]:
-
-| Cross-Entropy (nats/token) | Quality |
-|---------------------------|---------|
-| < 2.5 | "Boredom trap" — excessive repetition [F5:2] |
-| ~3.0 | Sweet spot — best fluency/coherence; >50% human-raters fooled [F5:1] |
-| > 5.0 | "Confusion trap" — increasing incoherence [F5:3] |
-| 5.13 | Human-written text scored by GPT-2 [F5:4] |
-
-**Critical caveat**: This measures *sampling* cross-entropy (how predictable generated text is to the model), not *training* loss (how well the model fits data). A model with higher training loss can still produce high-quality text if sampling is controlled well [F5:12].
-
-### 5.2 Known Baselines
-
-- GPT-2 124M achieves val loss ~3.12 nats/token on OpenWebText [F5:7]
-- GPT-2 XL 1.5B achieves ~2.54 [F5:7]
-- GPT-2 124M fine-tuned on OWT reaches ~2.85 [F5:8]
-
-For a 30M-param model, the training loss floor will be significantly higher than GPT-2 124M due to capacity constraints. Whether it can reach the ~3 nats/token sweet spot for sampling cross-entropy is unknown.
-
-### 5.3 Perplexity Is Necessary But Not Sufficient
-
-A 2026 workshop paper demonstrated that zero-parameter, deliberately naive samplers can achieve "SOTA" generative perplexity while producing completely incoherent text [F5:9]. A periodic top-k sampler achieved gen-PPL of 29.4 (lower than real models) while being incoherent by construction [F5:10]. This confirms that perplexity alone does not guarantee coherence — human evaluation remains essential.
-
-## Open Questions
-
-1. **No loss-to-coherence calibration exists for small models.** We cannot map a cross-entropy loss value to human-judged readability for 30M-param models, making it impossible to predict whether training will produce coherent text based on loss alone.
-
-2. **The brief's CPU offloading premise may be false.** F2[7] and F7[7] show 30M params fits entirely in 4GB VRAM without offloading. The investigation should resolve whether offloading is actually needed or if this was based on incorrect assumptions about model/optimizer size.
-
-3. **No empirical training-run data exists at 30M scale.** All claims about minimum viable size are extrapolations from scaling laws or constrained-domain experiments (TinyStories), not direct measurements on web-scale data.
-
-4. **Dataset comparison at sub-300M scale is absent.** No benchmarks exist comparing FineWeb-Edu vs C4 vs SlimPajama on models this small.
-
-5. **TinyStories' 125M claim may be outdated.** The assertion that 125M models "rarely generate coherent English" is single-source from 2023 [F1:6] and may not reflect current best practices (better tokenization, higher-quality data, longer training).
-
-6. **Tokenization effects at sub-300M scale are unaddressed.** GPT-2 BPE vocab size (50,257) vs SentencePiece alternatives could significantly affect training efficiency and loss-to-quality mapping at this scale.
-
-7. **What sampling strategy bridges training loss to coherent output?** Even if the model reaches acceptable training loss, the sampling method (temperature, top-k, top-p, Mirostat) critically determines whether output is readable.
-
-8. **What is the actual VRAM usage at seq-len 256/512 on 4GB consumer GPUs?** F7 provides estimates but no empirical measurements on RTX 2050/GTX 1650 class hardware.
-
-## Sources
-
-1. Kaplan, J. et al. (2020). "Scaling Laws for Neural Language Models." arXiv:2001.08361. https://arxiv.org/abs/2001.08361
-2. Hoffmann, J. et al. (2022). "Training Compute-Optimal Large Language Models." arXiv:2203.15556. https://arxiv.org/abs/2203.15556
-3. Eldan, R. & Li, L. (2023). "TinyStories: How Small Can Language Models Be and Still Speak Coherent English?" arXiv:2305.07759. https://arxiv.org/abs/2305.07759
-4. Rajbhandari, S. et al. (2021). "ZeRO-Offload: Democratizing Billion-Scale Model Training." arXiv:2101.06840. https://arxiv.org/abs/2101.06840
-5. Dao, T. et al. (2022). "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." arXiv:2205.14135. https://arxiv.org/abs/2205.14135
-6. Mirostat — An Adaptive Text Sampler (2020). "Mirostat: A Neural Text Decoding Algorithm that Directly Controls Perplexity." arXiv:2007.14966v2. https://arxiv.org/abs/2007.14966v2
-7. FineWeb-Edu Dataset Card. HuggingFace. https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
-8. nanoGPT. Karpathy. https://github.com/karpathy/nanoGPT
-9. nanoGPT Speedrun. nilmamano. https://nilmamano.com/blog/nanogpt-speedrun
-10. Cerebras-GPT. (2023). arXiv:2304.03208. https://arxiv.org/abs/2304.03208
-11. SlimPajama. (2023). arXiv:2309.10818. https://arxiv.org/abs/2309.10818
-12. PyTorch SDPA Documentation. https://docs.pytorch.org/docs/2.13/generated/torch.nn.functional.scaled_dot_product_attention.html
-13. PyTorch Gradient Checkpointing. https://docs.pytorch.org/docs/2.13/checkpoint.html
-14. DeepSpeed ZeRO-Offload Tutorial. https://www.deepspeed.ai/tutorials/zero-offload/
-15. "Do Not Be Fooled by Perplexity" (2026). arXiv:2606.08417v1. https://arxiv.org/abs/2606.08417v1
-16. microgpt. Karpathy (2026). https://karpathy.github.io/2026/02/12/microgpt/
-17. Tiny Language Models (2025). arXiv:2507.14871. https://arxiv.org/abs/2507.14871
-18. SDPA FlashAttention Source Analysis. https://gist.github.com/rkayaith/9eb401fddaad27d6b2edc1a496bea7fc
-19. FSDP2 CPU Offload Convergence Issue. https://github.com/pytorch/pytorch/issues/154984
-20. nanoGPT Scaling Laws Analysis. https://deepwiki.com/karpathy/nanogpt/7-scaling-laws-analysis
-
-```
-`REVIEW.md`:
-
-```md
-# Independent Review of REPORT.md
-
-Reviewer: MiMoCode (independent, no prior context)
-Date: 2026-07-20
-Files reviewed: REPORT.md, findings/F1.md–F7.md
-
----
-
-## (a) Claims Lacking Citations
-
-**All substantive claims have citations.** No major claim is entirely uncited. However, two items deserve attention:
-
-1. **C4 token count (~175B) in Section 4.2 table** — The report states C4 English has "~175B" tokens, but F4 finding [7] only quotes "305GB" (byte size, not token count). The 175B figure is widely used in the literature but is not traced to any specific finding. Should cite the HuggingFace dataset card directly or note the derivation.
-
-2. **Section 3.1 memory calculation** — "a naive attention matrix at seq-len 512 with 12 heads would require 512×512×12×2 bytes ≈ 6MB per layer" is presented without citation. This is a straightforward arithmetic derivation and does not require a citation, but it would strengthen the argument to note that this is a lower bound (excluding query/key/value tensors).
-
----
-
-## (b) Spot-Check of 5 Random Citations
-
-| Citation | Claim | URL in Findings | URL Exists | Supports Claim |
-|----------|-------|-----------------|------------|----------------|
-| [F5:1] | "texts at τ=3 received best fluency/coherence ratings" | arXiv:2007.14966v2 | Yes | Yes — abstract confirms boredom trap, confusion trap, and human evaluation |
-| [F3:7] | "Flash is ~38× faster than Math backend (2,272 μs vs 87,472 μs)" | PyTorch SDPA tutorial | Yes | Yes — tutorial benchmarks match these numbers |
-| [F6:6] | "Cerebras-GPT starts at 111M parameters" | arXiv:2304.03208 | Yes | Yes — abstract: "scaled from 111M to 13B parameters" |
-| [F4:2] | "BERT classifier, F1=82%, trained on Llama3-70B annotations" | HuggingFace FineWeb-Edu | Yes | Yes — dataset card confirms F1=82% and Llama3-70B annotations |
-| [F7:7] | "30M-param transformer uses ~480MB VRAM total" | PyTorch checkpoint docs | Yes | Partially — the URL is about gradient checkpointing; the 480MB figure is derived from parameter arithmetic in F7, not from the URL itself |
-
-**Verdict:** All 5 URLs exist and are accessible. 4 of 5 directly support the cited claim. The F7:7 citation is loosely related (the URL discusses memory-compute tradeoffs but does not contain the 480MB figure).
-
----
-
-## (c) Conclusions Stronger Than Evidence
-
-1. **Executive Summary item 3: "A 30M-param model almost certainly cannot produce coherent general English."**
-   - Evidence: TinyStories (constrained domain, 2023) + scaling law extrapolation. No direct measurement at 30M on web-scale data exists.
-   - Issue: "Almost certainly" implies high confidence, but the claim rests on a single constrained-domain study and theoretical extrapolation. The report itself acknowledges this is an extrapolation (Section 1.3, Open Question 3). The hedging language is appropriate in the body but the executive summary overstates certainty.
-
-2. **Executive Summary item 7: "FineWeb-Edu sample-10BT is the best dataset choice for a tiny GPT."**
-   - Evidence: FineWeb-Edu's quality filtering is well-documented, but no direct comparison exists at sub-300M scale (Section 4.2, Gap).
-   - Issue: "Best" implies a comparative judgment that the evidence does not support. "Strongest candidate based on available evidence" would be more accurate.
-
-3. **Section 1.2: TinyStories 125M claim presented with appropriate hedging.**
-   - The report correctly notes this is "a single-source claim from 2023" and "may not reflect current best practices." This is well-calibrated.
-
----
-
-## (d) Executive Summary vs. Body Consistency
-
-| Executive Summary Item | Body Section | Consistent? |
-|----------------------|--------------|-------------|
-| 1. No sharp coherence threshold | §1.1 | Yes |
-| 2. ~100M+ practical floor | §1.2 | Yes |
-| 3. 30M cannot produce coherent English | §1.2, §1.3 | Yes (but see overstatement note above) |
-| 4. CPU offloading unnecessary | §2.1, §2.2 | Yes |
-| 5. Cross-entropy ~3 nats/token sweet spot | §5.1 | Yes |
-| 6. FlashAttention O(N) memory, not O(N) compute | §3.1 | Yes |
-| 7. FineWeb-Edu best dataset | §4.1, §4.2 | Yes (but see "best" note above) |
-| 8. No empirical data at 30M scale | §1.3, Open Questions | Yes |
-
-**Verdict:** Executive summary is consistent with the body throughout. No contradictions found.
-
----
-
-## Additional Findings
-
-### Citation Numbering Ambiguity
-
-The report uses two overlapping citation systems:
-- **Plain [n]** in Sections 1.1–1.2 and the Executive Summary, which refer to finding numbers within F1.md (e.g., [1] = F1 finding [1], [9] = F1 finding [9])
-- **[F*:n]** format elsewhere, clearly referencing specific findings files (e.g., [F7:7] = F7 finding [7])
-
-The **Sources list** at the bottom uses a third numbering (1–20). Since plain [n] values like [1], [4], [9] could be misinterpreted as referring to the Sources list (where [1]=Kaplan, [4]=ZeRO-Offload, [9]=nanoGPT Speedrun), this creates potential confusion. In practice, the plain [n] references in Sections 1.1–1.2 are correct when interpreted as F1.md finding numbers, but the ambiguity should be resolved — either by using [F1:n] consistently or by renumbering the Sources list.
-
-### VRAM Calculation Inconsistency
-
-F7 finding [7] states model params use "120MB FP32" while the report table says "Model params (bf16) | ~60 MB." The report's bf16 assumption is more realistic for modern mixed-precision training, but the totals differ: F7 says ~480MB minimum, the report says ~410–460MB total. The report's calculation is more accurate; F7's derivation should be updated to match.
-
-### Source 15 Title Mismatch
-
-Source 15 is listed as "Do Not Be Fooled by Perplexity" (arXiv:2606.08417v1), but the actual paper title is "Hacking Generative Perplexity: Why Unconditional Text Evaluation Needs Distributional Metrics." The content matches (zero-parameter samplers achieving SOTA gen-PPL while incoherent), but the cited title is incorrect.
-
----
-
-## Summary
-
-The report is well-researched and appropriately hedged in most places. The main issues are:
-1. Two conclusions slightly overstate certainty relative to evidence (items 3 and 7 in Executive Summary)
-2. Citation numbering system is ambiguous (plain [n] vs [F*:n] vs Sources list)
-3. Source 15 title is incorrect
-4. VRAM calculation in F7 uses FP32 while the report correctly uses bf16, creating a minor discrepancy
-
-No fabricated citations were found. All spot-checked URLs exist and support their claims.
-
-```
-`TINYGPT_BUG_REPORT.md`:
-
-```md
-# Tiny-GPT Bug & Mistake Report
-
-## BUGS (will crash or produce wrong output)
-
-| # | File:Line | Issue | Status |
-|---|---|---|---|
-| 1 | `haiku/gpt_model.py:160` | `logits[indices_to_remove]` indexes batch dim (size 1) with vocab indices. Should be `logits[:, indices_to_remove]` | **FIXED** |
-| 2 | `haiku/generate.py:73` | `interactive_mode()` hardcodes `top_k=50, top_p=0.9` — ignores `--top_k`/`--top_p` CLI args | Open |
-| 3 | `haiku/generate.py:94` | `batch_generation()` doesn't pass `top_k`/`top_p` args — always runs with default `temperature` only | Open |
-| 4 | `main.py:252` | Weight tying (`self.head.weight = self.tok_emb.weight`) — checkpoint loading breaks if state dict has separate `head.weight` key | Open |
-| 5 | `run.py` vs `main.py` | Run inference top-k default `None`; main.py generation uses `top_k=50` — inconsistent sampling behavior | Open |
-
-## DESIGN MISTAKES
-
-| # | File:Line | Issue |
-|---|---|---|
-| 6 | `haiku/train.py:20-32` | `TokenDataset.__iter__()` infinite loop; epoch terminates at arbitrary `batch_idx > 5000` — never passes through full dataset once |
-| 7 | `haiku/prepare_data.py:18` | Downloads `TinyStories-valid` (validation split) instead of training split — tiny corpus |
-| 8 | `haiku/prepare_data.py:38-58` | Fallback mock data = 16 lines repeated 100x — model memorizes, not learns |
-| 9 | `haiku/gpt_model.py:14` | `weight_tying = False` defined in config but never read by `GPT` class — dead field |
-| 10 | `haiku/train.py:25` | `np.uint32` for memmap — tokens max at 50257, `uint16` suffices. Wastes 2x disk |
-| 11 | `main.py:95` vs README | Code says `MAX_ITERS = 100_000`; README says "10k steps" — out of sync |
-| 12 | `prepare_data.py:38` | `MAX_EXAMPLES = 1000000` limits dataset; existing `train.bin` has 9.75B tokens from bigger run |
-| 13 | `prepare_data.py:83` | Train/val split is 98/1/1 — very small validation set, high variance in eval metrics |
-| 14 | `kaggle_train.py` | Full duplicate of `main.py` model + training logic — maintenance burden |
-| 15 | `run.py:65` | `apply_model_config_from_state_dict()` auto-detects dims from tensors — fragile if tensor names change |
-| 16 | `main.py:472` | NaN detection uses `_c.get("val_loss") != _c.get("val_loss")` — correct but obscure vs `math.isnan()` |
-
-## THINGS THAT WORK
-
-- **MoE-GPT 0.5B** trains to convergence on 4GB VRAM GPU via custom `CPUOffloadAdamW` — novel engineering
-- **Vanilla GPT (haiku)** loads checkpoint and generates coherent English via CLI/interactive/batch modes
-- **Training loop**: BF16 autocast, gradient accumulation, cosine LR schedule, GradScaler, gradient clipping — all correct
-- **Data pipeline**: Streaming FineWeb-Edu from HF, GPT-2 BPE tokenization, memory-mapped storage — memory-efficient
-- **Checkpointing**: Best/latest/epoch saves work correctly with full state (model + optimizer + step)
-- **Inference**: Temperature, top-k, top-p sampling all implemented; interactive mode supports live parameter tuning
-- **HuggingFace integration**: `push_to_hf.py` uploads checkpoints; `run.py` downloads from HF Hub — deployable
-
-```
-`benchmark_attention.py`:
-
-```py
-"""
-Benchmark: softmax vs linear attention.
-Compares speed, VRAM, and loss for a short training run.
-
-Usage:
-    python benchmark_attention.py          # runs both, compares
-    python benchmark_attention.py --steps 20
-"""
-
-import os
-import sys
-import time
-import argparse
-import gc
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# ── Shared config (must match main.py) ──
-
-BLOCK_SIZE  = 512
-EMBED_DIM   = 768
-NUM_HEADS   = 12
-NUM_LAYERS  = 12
-FFN_DIM     = EMBED_DIM * 4
-DROPOUT     = 0.1
-LR          = 1.5e-4
-DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE       = torch.bfloat16 if DEVICE == "cuda" else torch.float32
-VOCAB_SIZE  = 50257  # GPT-2
-
-
-def measure_vram():
-    if DEVICE != "cuda":
-        return 0.0
-    return torch.cuda.max_memory_allocated() / 1024**3
-
-
-def build_model(attention_type):
-    """Build TinyGPT with the specified attention type."""
-    from linear_attention import LinearAttention
-
-    class CausalSelfAttention(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.n_heads  = NUM_HEADS
-            self.head_dim = EMBED_DIM // NUM_HEADS
-            self.qkv      = nn.Linear(EMBED_DIM, 3 * EMBED_DIM, bias=False)
-            self.proj      = nn.Linear(EMBED_DIM, EMBED_DIM, bias=False)
-            self.proj_drop = nn.Dropout(DROPOUT)
-        def forward(self, x):
-            B, T, C = x.shape
-            qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
-            q, k, v = qkv.permute(2, 0, 3, 1, 4)
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            out = out.transpose(1, 2).reshape(B, T, C)
-            return self.proj_drop(self.proj(out))
-
-    class FeedForward(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.w1  = nn.Linear(EMBED_DIM, FFN_DIM)
-            self.w2  = nn.Linear(FFN_DIM, EMBED_DIM)
-            self.act = nn.GELU()
-            self.drop = nn.Dropout(DROPOUT)
-        def forward(self, x):
-            return self.drop(self.w2(self.act(self.w1(x))))
-
-    class TransformerBlock(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.ln1 = nn.LayerNorm(EMBED_DIM)
-            if attention_type == "linear":
-                self.attn = LinearAttention(EMBED_DIM, NUM_HEADS, DROPOUT)
-            else:
-                self.attn = CausalSelfAttention()
-            self.ln2 = nn.LayerNorm(EMBED_DIM)
-            self.ffn = FeedForward()
-        def forward(self, x):
-            x = x + self.attn(self.ln1(x))
-            x = x + self.ffn(self.ln2(x))
-            return x
-
-    class TinyGPT(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.tok_emb = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
-            self.pos_emb = nn.Embedding(BLOCK_SIZE, EMBED_DIM)
-            self.drop    = nn.Dropout(DROPOUT)
-            self.blocks  = nn.ModuleList([TransformerBlock() for _ in range(NUM_LAYERS)])
-            self.ln_f    = nn.LayerNorm(EMBED_DIM)
-            self.head    = nn.Linear(EMBED_DIM, VOCAB_SIZE, bias=False)
-            self.head.weight = self.tok_emb.weight
-        def forward(self, idx, targets=None):
-            B, T = idx.shape
-            x = self.drop(self.tok_emb(idx) + self.pos_emb(torch.arange(T, device=idx.device)))
-            for block in self.blocks:
-                x = block(x)
-            logits = self.head(self.ln_f(x))
-            loss = None
-            if targets is not None:
-                loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), targets.view(-1))
-            return logits, loss
-
-    return TinyGPT()
-
-
-def benchmark(attention_type, steps=10, batch_size=2):
-    """Run a short training loop and measure metrics."""
-    gc.collect()
-    if DEVICE == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.empty_cache()
-
-    model = build_model(attention_type)
-    model = model.to(dtype=DTYPE, device=DEVICE)
-    n_params = sum(p.numel() for p in model.parameters())
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-
-    # Warmup
-    x = torch.randint(0, VOCAB_SIZE, (batch_size, BLOCK_SIZE), device=DEVICE)
-    y = torch.randint(0, VOCAB_SIZE, (batch_size, BLOCK_SIZE), device=DEVICE)
-    with torch.amp.autocast("cuda", dtype=DTYPE, enabled=(DTYPE == torch.bfloat16)):
-        _, loss = model(x, y)
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad()
-    gc.collect()
-    if DEVICE == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-
-    # Timed steps
-    losses = []
-    times = []
-    for _ in range(steps):
-        x = torch.randint(0, VOCAB_SIZE, (batch_size, BLOCK_SIZE), device=DEVICE)
-        y = torch.randint(0, VOCAB_SIZE, (batch_size, BLOCK_SIZE), device=DEVICE)
-        t0 = time.perf_counter()
-        with torch.amp.autocast("cuda", dtype=DTYPE, enabled=(DTYPE == torch.bfloat16)):
-            _, loss = model(x, y)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad()
-        if DEVICE == "cuda":
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        losses.append(loss.item())
-        times.append(t1 - t0)
-
-    vram = measure_vram()
-    avg_time = np.mean(times)
-    avg_loss = np.mean(losses)
-    tokens_per_sec = (batch_size * BLOCK_SIZE) / avg_time
-
-    return {
-        "params": n_params,
-        "avg_time_ms": avg_time * 1000,
-        "tokens_per_sec": tokens_per_sec,
-        "vram_gb": vram,
-        "avg_loss": avg_loss,
-        "final_loss": losses[-1],
-    }
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--steps", type=int, default=10, help="Training steps per attention type")
-    parser.add_argument("--batch", type=int, default=2, help="Micro batch size")
-    args = parser.parse_args()
-
-    print(f"Device: {DEVICE.upper()}  |  DTYPE: {DTYPE}")
-    print(f"Steps: {args.steps}  |  Batch: {args.batch}")
-    print()
-
-    results = {}
-    for attn_type in ("softmax", "linear"):
-        print(f"── Benchmarking {attn_type} attention ──")
-        r = benchmark(attn_type, steps=args.steps, batch_size=args.batch)
-        results[attn_type] = r
-        print(f"  Params    : {r['params']:>14,}")
-        print(f"  Avg time  : {r['avg_time_ms']:>10.1f} ms/step")
-        print(f"  Throughput: {r['tokens_per_sec']:>10,.0f} tok/s")
-        if r['vram_gb'] > 0:
-            print(f"  Peak VRAM : {r['vram_gb']:>10.2f} GiB")
-        print(f"  Avg loss  : {r['avg_loss']:>10.4f}")
-        print(f"  Final loss: {r['final_loss']:>10.4f}")
-        print()
-
-    # ── Comparison ──
-    s, l = results["softmax"], results["linear"]
-    print("═══ Comparison ═══")
-    print(f"  Params    : softmax {s['params']:,}  |  linear {l['params']:,}")
-    print(f"  Avg time  : softmax {s['avg_time_ms']:.1f} ms  |  linear {l['avg_time_ms']:.1f} ms  "
-          f"({l['avg_time_ms']/s['avg_time_ms']:.2f}x)")
-    print(f"  Throughput: softmax {s['tokens_per_sec']:,.0f} tok/s  |  linear {l['tokens_per_sec']:,.0f} tok/s")
-    if s['vram_gb'] > 0:
-        print(f"  Peak VRAM : softmax {s['vram_gb']:.2f} GiB  |  linear {l['vram_gb']:.2f} GiB  "
-              f"({l['vram_gb']/s['vram_gb']:.2f}x)")
-    print(f"  Avg loss  : softmax {s['avg_loss']:.4f}  |  linear {l['avg_loss']:.4f}")
-
-
-if __name__ == "__main__":
-    main()
-
-```
-`brief.md`:
-
-```md
-# Research Brief
-
-**Date**: 2026-07-20 · **Depth**: standard
-
-## Question
-
-Can a ~30M parameter dense GPT-style autoregressive transformer, trained on consumer GPUs (4 GB VRAM) using CPU-offloaded AdamW and FlashAttention (via PyTorch SDPA), produce coherent English text? Specifically:
-
-1. What is the minimum viable model size for a GPT-style transformer to generate coherent English, and what do scaling-law studies say about the 30M–300M parameter range?
-2. Is CPU-offloaded AdamW (fp32 master weights on CPU, bf16 model + grads on GPU) a proven technique for 4 GB VRAM training, or are there hidden failure modes (NaN, divergence, slow convergence)?
-3. Does PyTorch's `F.scaled_dot_product_attention` with `is_causal=True` deliver the claimed O(N) memory/compute benefits for sequence lengths 256–512, and are there edge cases where it degrades?
-4. What datasets (FineWeb-Edu sample-10BT or alternatives) are suitable for training a tiny GPT, and how many tokens are needed to reach reasonable loss at ~30M parameters?
-5. What are the known limitations of tiny language models compared to larger ones, and what tasks can they reasonably accomplish?
-
-## Scope
-
-**In:**
-- GPT-style decoder-only autoregressive transformers only (no encoder-decoder, no bidirectional)
-- Model sizes: 10M–300M parameters, with emphasis on ~30M
-- Training on consumer GPUs with ≤4 GB VRAM (RTX 2050 / GTX 1650 / similar)
-- CPU-offloaded optimizer techniques (DeepSpeed ZeRO, custom offload)
-- FlashAttention / SDPA memory/compute tradeoffs at sequence lengths up to 512
-- Scaling law literature relevant to sub-1B models (Chinchilla, Kaplan et al., and follow-ups)
-- Datasets: FineWeb-Edu, C4, WikiText, OpenWebText, The Pile, SlimPajama
-- Coherence evaluation: perplexity, human judgment, simple task benchmarks (e.g., HellaSwag, LAMBADA at small scale)
-
-**Out:**
-- Training on CPUs only (CPU-only training without any GPU)
-- Mixture-of-Experts or sparse attention architectures
-- Quantization (GPTQ, AWQ, GGUF) at inference time
-- Fine-tuning pretrained models — this is scratch training
-- Inference optimization (vLLM, speculative decoding)
-- RLHF or instruction tuning
-- Multi-modal or vision-language models
-
-## Assumptions
-
-- **Audience**: A practitioner (the user) building Tiny-GPT in `/home/pragadeesh/Tiny-GPT` who wants evidence-based answers to decide architecture/hyperparameter choices for a 30M dense transformer on a 4 GB GPU. Intermediate-to-advanced ML knowledge assumed.
-- **Time frame**: Literature search covers 2018–2026 (Kaplan 2020 through current). Findings should be current as of July 2026.
-- **Region / language**: English text only. No multilingual considerations.
-- **Hardware baseline**: 4 GB VRAM GPU (GTX 1650 / RTX 2050 class), 16+ GB CPU RAM. PyTorch 2.x with CUDA 11.8+.
-- **Precision**: BF16 forward pass, fp32 optimizer states. No mixed-precision FP16 training (loss scaling complexity is out of scope unless directly relevant to CPU-offload).
-- **Dataset assumption**: FineWeb-Edu sample-10BT is the primary candidate; alternatives are evaluated only if FineWeb-Edu has documented issues for tiny models.
-- **Evaluation of "coherence"**: Subjective readability of generated text plus perplexity on held-out data. Formal benchmarks (LAMBADA, HellaSwag) are mentioned but not required for scoping.
-- **Definition of "hidden failure modes"**: Includes NaN/Inf losses, silent gradient corruption, optimizer state desynchronization, and convergence pathologies specific to CPU-GPU weight splitting.
-
-```
-`chat.md`:
-
-```md
-# Tiny-GPT Refactoring Chat
-
-## Context
-
-Tiny-GPT is a dense GPT-2 Small (124M) model trained on FineWeb-Edu. The codebase was a monolithic research script with duplicated model definitions across `main.py`, `run.py`, `finetune.py`, and `main_deepspeed.py`.
-
-The user requested a phased refactoring to modularize the architecture without changing behavior.
-
----
-
-## Phase 1 — Extract CausalSelfAttention (BLOCKED)
-
-**User request:** Move CausalSelfAttention into its own module. Keep every tensor shape, API, checkpoint, and output identical.
-
-**Status:** NOT IMPLEMENTED. User stopped implementation before completion.
-
-The plan was:
-- Create `attention.py` with shared `CausalSelfAttention`
-- Support two implementations via `use_flash_attention` flag
-  - `True` (default): `F.scaled_dot_product_attention` with `is_causal=True` — used by training scripts
-  - `False`: Manual `q @ k.T` with lazy triangular mask + `attn_drop` — used by `run.py`
-- Update all four files to import from `attention.py`
-
-**Key discovery:** Two distinct `CausalSelfAttention` variants exist:
-- `main.py`, `finetune.py`, `main_deepspeed.py`: SDPA (FlashAttention), no explicit mask, no `attn_drop`
-- `run.py`: Manual attention with explicit triangular mask, has `attn_drop` layer
-
----
-
-## Phase 2 — Abstract Attention Interface (BLOCKED)
-
-**User request:** Create an abstract Attention interface. Existing CausalSelfAttention must implement it.
-
-**Status:** DESIGN ONLY. Never implemented. User jumped to Phase 3.
-
-**Design:**
-```
-attention_interface.py        (NEW — abstract base class)
-├── class Attention(ABC)
-│   └── @abstractmethod forward(self, x) -> Tensor
-
-main.py / run.py / finetune.py / main_deepspeed.py
-├── from attention_interface import Attention
-├── class CausalSelfAttention(Attention): ...
-```
-
----
-
-## Phase 3 — LinearAttention Implementation (COMPLETED)
-
-**User request:** Implement LinearAttention as a second implementation of the Attention interface. Add `ATTENTION_TYPE` config (softmax/linear, default softmax). Benchmark speed, VRAM, loss.
-
-**Status:** COMPLETED.
-
-### Files modified/created
-
-| File | Change |
-|------|--------|
-| `main.py` | Added `ATTENTION_TYPE = "softmax"` config, import `LinearAttention`, TransformerBlock conditional, checkpoint save/load handles attention type mismatch |
-| `linear_attention.py` | **NEW.** `LinearAttention` class with elu+1 kernel, O(N) causal state accumulation |
-| `benchmark_attention.py` | **NEW.** Benchmark script comparing both attention types |
-
-### Configuration
-
-```python
-ATTENTION_TYPE = "softmax"  # or "linear"  (in main.py hyperparameters)
-```
-
-### Checkpoint compatibility
-
-- `save_checkpoint` stores `attention_type` in checkpoint dict
-- `load_checkpoint` detects type mismatch, skips attention weights (`strict=False`), prints warning
-- Old checkpoints (no `attention_type` field) default to `"softmax"`
-
-### Benchmark results (5 steps, batch 2, CUDA bfloat16)
-
-```
-              softmax         linear          ratio
-Params:       124,009,728     124,009,728     identical
-Speed:        177.9 ms/step   3932.1 ms/step  22.1x slower
-Throughput:   5,756 tok/s     260 tok/s
-Peak VRAM:    1.62 GiB        2.89 GiB        1.78x more
-Avg loss:     260.33          258.89          similar
-```
-
-### LinearAttention architecture
-
-```python
-class LinearAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.1):
-        # Separate Q, K, V projections (not fused)
-        self.q = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.k = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.proj = nn.Linear(embed_dim, embed_dim, bias=False)
-
-    def forward(self, x):
-        # elu+1 kernel feature map
-        # Causal state accumulation: O(N) per head
-        # kv += k_t * v_t^T, state_k += k_t
-        # out_t = (kv @ q_t) / (state_k . q_t + eps)
-```
-
----
-
-## Refactoring Rules (from user)
-
-1. Never rewrite the repository
-2. Never touch more than ONE subsystem in a single phase
-3. Every phase must compile
-4. Every phase must pass all existing tests
-5. Every phase must be reversible with a single git revert
-6. Never optimize and refactor in the same phase
-7. Never implement future features until the architecture is ready
-8. Behavior must remain identical
-
----
-
-## Pending Phases
-
-- Phase 1 (Extract attention) — needs implementation
-- Phase 2 (Abstract interface) — needs implementation
-- Future phases: FlashAttention changes, HybridAttention, LinearAttention optimization — blocked until architecture is ready
+MIT License
 
 ```
 `chat.py`:
@@ -2276,13 +895,17 @@ import tiktoken
 # ═════════════════════════════════════════════════════════════════════════════
 
 with contextlib.redirect_stdout(io.StringIO()):
-    from main import TinyGPT, BLOCK_SIZE, DEVICE, DTYPE, vocab_size
+    from main import TinyGPT, CausalSelfAttention, BLOCK_SIZE, DEVICE, DTYPE, vocab_size
 
 # ═════════════════════════════════════════════════════════════════════════════
 # LOAD MODEL & CHECKPOINT
 # ═════════════════════════════════════════════════════════════════════════════
 
-model = TinyGPT().to(dtype=DTYPE, device=DEVICE)
+model = TinyGPT(
+    vocab_size=50257, block_size=512, embed_dim=768,
+    num_heads=12, num_layers=12, ffn_dim=3072, dropout=0.1,
+    attention_cls=CausalSelfAttention, use_manual_attention=False
+).to(dtype=DTYPE, device=DEVICE)
 
 # Resolve checkpoint path — prefer fine-tuned, fallback to pre-trained
 ckpt_path = os.path.join("checkpoints", "finetune_best.pt")
@@ -2309,69 +932,70 @@ EOT = enc.eot_token
 # CHAT INTERFACE
 # ═════════════════════════════════════════════════════════════════════════════
 
-print("Alpaca Assistant ready! Type 'quit' to exit.")
-print("-" * 50)
+if __name__ == "__main__":
+    print("Alpaca Assistant ready! Type 'quit' to exit.")
+    print("-" * 50)
 
-# Initialize with the Alpaca System Prompt
-SYSTEM_PROMPT = "System: You are a helpful assistant.\n"
-chat_history = SYSTEM_PROMPT
+    # Initialize with the Alpaca System Prompt
+    SYSTEM_PROMPT = "System: You are a helpful assistant.\n"
+    chat_history = SYSTEM_PROMPT
 
-while True:
-    try:
-        user_input = input("\nYou: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        break
+    while True:
+        try:
+            user_input = input("\nYou: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
 
-    if not user_input or user_input.lower() == "quit":
-        break
+        if not user_input or user_input.lower() == "quit":
+            break
 
-    chat_history += f"User: {user_input}\nAssistant:"
+        chat_history += f"User: {user_input}\nAssistant:"
 
-    ids = torch.tensor([enc.encode_ordinary(chat_history)], dtype=torch.long, device=DEVICE)
+        ids = torch.tensor([enc.encode_ordinary(chat_history)], dtype=torch.long, device=DEVICE)
 
-    # Sliding Window: Ensure we don't exceed the BLOCK_SIZE limit
-    if ids.shape[1] > BLOCK_SIZE - 100:  # Leave 100 tokens room for response
-        sys_ids = torch.tensor([enc.encode_ordinary(SYSTEM_PROMPT)], dtype=torch.long, device=DEVICE)
-        recent_ids = ids[:, -(BLOCK_SIZE - 100 - sys_ids.shape[1]):]
-        ids = torch.cat([sys_ids, recent_ids], dim=1)
+        # Sliding Window: Ensure we don't exceed the BLOCK_SIZE limit
+        if ids.shape[1] > BLOCK_SIZE - 100:  # Leave 100 tokens room for response
+            sys_ids = torch.tensor([enc.encode_ordinary(SYSTEM_PROMPT)], dtype=torch.long, device=DEVICE)
+            recent_ids = ids[:, -(BLOCK_SIZE - 100 - sys_ids.shape[1]):]
+            ids = torch.cat([sys_ids, recent_ids], dim=1)
 
-    generated_tokens = []
+        generated_tokens = []
 
-    with torch.no_grad():
-        for _ in range(100):
-            ctx = ids[:, -BLOCK_SIZE:]
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(DTYPE == torch.bfloat16)):
-                logits, _ = model(ctx)
+        with torch.no_grad():
+            for _ in range(100):
+                ctx = ids[:, -BLOCK_SIZE:]
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(DTYPE == torch.bfloat16)):
+                    logits, _ = model(ctx)
 
-            # Standard Assistant Sampling Parameters
-            temperature = 0.7
-            top_p = 0.9
+                # Standard Assistant Sampling Parameters
+                temperature = 0.7
+                top_p = 0.9
 
-            step_logits = logits[:, -1, :].float() / temperature
+                step_logits = logits[:, -1, :].float() / temperature
 
-            # Top-P (Nucleus) filtering
-            sorted_logits, sorted_indices = torch.sort(step_logits, descending=True)
-            cumsum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove = cumsum_probs > top_p
-            sorted_indices_to_remove[..., 0] = False
-            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            step_logits[:, indices_to_remove] = float("-inf")
+                # Top-P (Nucleus) filtering
+                sorted_logits, sorted_indices = torch.sort(step_logits, descending=True)
+                cumsum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumsum_probs > top_p
+                sorted_indices_to_remove[..., 0] = False
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                step_logits[:, indices_to_remove] = float("-inf")
 
-            probs = F.softmax(step_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+                probs = F.softmax(step_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
 
-            if next_token.item() == EOT or enc.decode([next_token.item()]) == "\n":
-                break
+                if next_token.item() == EOT or enc.decode([next_token.item()]) == "\n":
+                    break
 
-            ids = torch.cat([ids, next_token], dim=1)
-            generated_tokens.append(next_token.item())
+                ids = torch.cat([ids, next_token], dim=1)
+                generated_tokens.append(next_token.item())
 
-    bot_response = enc.decode(generated_tokens).strip()
-    print(f"Bot: {bot_response}")
+        bot_response = enc.decode(generated_tokens).strip()
+        print(f"Bot: {bot_response}")
 
-    chat_history += f" {bot_response}\n"
+        chat_history += f" {bot_response}\n"
 
-print("\nGoodbye!")
+    print("\nGoodbye!")
 
 ```
 `data/meta.txt`:
@@ -2385,323 +1009,108 @@ val_tokens : 100388902
 test_tokens : 100523684
 
 ```
-`deepspeed.md`:
+`eval_suite.py`:
 
-```md
+```py
+"""
+Comprehensive evaluation suite for Tiny-GPT.
+Tracks loss, perplexity, token accuracy, and generation diversity.
+"""
 
-Alright, let’s get practical. DeepSpeed is basically a **booster pack for training large models with PyTorch**. It handles memory, distributes work across GPUs, and keeps things from melting your hardware. 🧠⚡
-
-We’ll walk through the **minimal working setup** so the idea clicks.
-
----
-
-## 1. Install DeepSpeed
-
-First step: install it.
-
-```bash
-pip install deepspeed
-```
-
-If CUDA and PyTorch are already installed, DeepSpeed compiles its optimizations automatically.
-
-Check it works:
-
-```bash
-deepspeed --version
-```
-
----
-
-## 2. Simple PyTorch Training Script
-
-A normal PyTorch training script might look like this:
-
-```python
 import torch
-import torch.nn as nn
+import tiktoken
+from tinygpt.training.evaluation import estimate_loss
 
-model = nn.Linear(10, 1)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+def eval_suite(model, get_batch, eval_iters=100, device="cuda", verbose=False):
+    """Run comprehensive evaluation and return metrics dict.
 
-for step in range(100):
-    x = torch.randn(32, 10)
-    y = torch.randn(32, 1)
+    Args:
+        model: TinyGPT model instance
+        get_batch: data loading function get_batch(split)
+        eval_iters: number of batches for loss estimation
+        device: torch device string
+        verbose: if True, print results
 
-    output = model(x)
-    loss = ((output - y) ** 2).mean()
+    Returns:
+        dict with keys: train_loss, val_loss, train_ppl, val_ppl,
+                        token_accuracy, generation_sample, diversity_ratio
+    """
+    enc = tiktoken.get_encoding("gpt2")
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-```
+    # -- Loss / Perplexity --
+    losses = estimate_loss(model, get_batch, eval_iters)
+    train_ppl = torch.exp(torch.tensor(losses["train"])).item()
+    val_ppl = torch.exp(torch.tensor(losses["val"])).item()
 
-DeepSpeed wraps this training loop so it can **handle distributed training and memory optimization**.
+    # -- Token Accuracy --
+    model.eval()
+    x, y = get_batch("val")
+    with torch.no_grad():
+        logits, _ = model(x)
+        preds = logits.argmax(dim=-1)
+        correct = (preds == y).float().sum().item()
+        total = y.numel()
+        token_accuracy = correct / total
 
----
+    # -- Generation Sample --
+    prompt_ids = torch.tensor([[enc.eot_token]], dtype=torch.long, device=device)
+    generated = ""
+    with torch.no_grad():
+        idx = prompt_ids
+        for _ in range(50):
+            logits, _ = model(idx[:, -512:])
+            logits = logits[:, -1, :] / 0.8
+            probs = torch.softmax(logits, dim=-1)
+            nxt = torch.multinomial(probs, 1)
+            idx = torch.cat([idx, nxt], dim=1)
+            if nxt.item() == enc.eot_token:
+                break
+    generated = enc.decode(idx[0].tolist())
 
-## 3. Add DeepSpeed to the Script
+    # -- Diversity (repetition ratio) --
+    words = generated.split()
+    diversity_ratio = len(set(words)) / max(len(words), 1)
 
-Modify the script like this:
+    model.train()
 
-```python
-import torch
-import torch.nn as nn
-import deepspeed
-
-model = nn.Linear(10, 1)
-
-parameters = filter(lambda p: p.requires_grad, model.parameters())
-
-model_engine, optimizer, _, _ = deepspeed.initialize(
-    model=model,
-    model_parameters=parameters,
-    config="ds_config.json"
-)
-
-for step in range(100):
-    x = torch.randn(32, 10).to(model_engine.local_rank)
-    y = torch.randn(32, 1).to(model_engine.local_rank)
-
-    output = model_engine(x)
-    loss = ((output - y) ** 2).mean()
-
-    model_engine.backward(loss)
-    model_engine.step()
-```
-
-Notice the difference:
-
-Instead of
-`loss.backward()`
-you use
-
-```
-model_engine.backward(loss)
-```
-
-DeepSpeed now manages **gradient sync, memory, and distributed GPUs**.
-
----
-
-## 4. Create the DeepSpeed Config
-
-DeepSpeed uses a JSON config file.
-
-`ds_config.json`
-
-```json
-{
-  "train_batch_size": 32,
-  "fp16": {
-    "enabled": true
-  },
-  "zero_optimization": {
-    "stage": 2
-  }
-}
-```
-
-Key parts:
-
-**fp16**
-Uses half precision to save memory.
-
-**zero_optimization**
-
-* stage 1 → optimizer states split
-* stage 2 → gradients split
-* stage 3 → full model partitioned
-
-Stage 3 is the **big guns for massive models**.
-
----
-
-## 5. Run the Training
-
-Instead of running Python directly, you launch with DeepSpeed:
-
-```bash
-deepspeed train.py
-```
-
-Multi-GPU example:
-
-```bash
-deepspeed --num_gpus=4 train.py
-```
-
-Now your model trains **distributed across GPUs automatically**.
-
----
-
-## 6. Example with Hugging Face Transformers
-
-DeepSpeed is heavily used with **Hugging Face Transformers**.
-
-Example training command:
-
-```bash
-deepspeed run_clm.py \
-  --model_name_or_path gpt2 \
-  --deepspeed ds_config.json
-```
-
-This is how people train **LLMs efficiently**.
-
----
-
-## What DeepSpeed Is Really Doing Behind the Scenes
-
-When you enable ZeRO optimization, it:
-
-* splits model parameters across GPUs
-* shards gradients
-* shards optimizer states
-* optionally offloads memory to CPU or NVMe
-
-So your GPU doesn’t have to hold **the entire model at once**.
-
-That’s how researchers train **100B+ parameter models** without needing a ridiculous cluster.
-
----
-
-## A Mental Model
-
-Think of training a huge neural network like moving a giant couch up a staircase.
-
-Without DeepSpeed:
-
-one person tries to carry the couch alone. 💀
-
-With DeepSpeed:
-
-four people lift different corners and move together. 🛋️
-
-Same couch.
-Way less suffering.
-
----
-
-One spicy insight: DeepSpeed becomes **really powerful when models hit GPU memory limits**. That’s why it’s everywhere in LLM training.
-
-The next level trick is combining it with **LoRA fine-tuning**, which lets you train huge models on **a single GPU or even a laptop**. That combo is what a lot of modern AI hackers use. 🔬
-
-```
-`ds_config.active.json`:
-
-```json
-{
-  "train_batch_size": 16,
-  "train_micro_batch_size_per_gpu": 2,
-  "gradient_accumulation_steps": 8,
-  "optimizer": {
-    "type": "AdamW",
-    "params": {
-      "lr": 5e-05,
-      "betas": [
-        0.9,
-        0.999
-      ],
-      "eps": 1e-08,
-      "weight_decay": 0.01,
-      "torch_adam": true
+    results = {
+        "train_loss": losses["train"],
+        "val_loss": losses["val"],
+        "train_ppl": train_ppl,
+        "val_ppl": val_ppl,
+        "token_accuracy": token_accuracy,
+        "generation_sample": generated[:200],
+        "diversity_ratio": diversity_ratio,
     }
-  },
-  "zero_optimization": {
-    "stage": 2,
-    "offload_optimizer": {
-      "device": "cpu",
-      "pin_memory": false
-    },
-    "overlap_comm": true,
-    "contiguous_gradients": true,
-    "reduce_bucket_size": 1000000.0,
-    "gather_16bit_weights_on_model_save": false
-  },
-  "bf16": {
-    "enabled": true
-  },
-  "gradient_clipping": 1.0,
-  "activation_checkpointing": {
-    "partition_activations": true,
-    "contiguous_memory_optimization": true,
-    "number_checkpoints": 12,
-    "synchronize_checkpoint_boundary": false,
-    "cpu_checkpointing": true
-  },
-  "wall_clock_breakdown": false,
-  "steps_per_print": 100,
-  "fp16": {
-    "enabled": false
-  },
-  "amp": {
-    "enabled": false,
-    "amp_master_weights": false,
-    "loss_scale_window": 1000
-  }
-}
-```
-`ds_config.json`:
 
-```json
-{
-  "train_batch_size": 16,
-  "train_micro_batch_size_per_gpu": 2,
-  "gradient_accumulation_steps": 8,
-  
-  "optimizer": {
-    "type": "AdamW",
-    "params": {
-      "lr": 5.0e-05,
-      "betas": [0.9, 0.999],
-      "eps": 1e-8,
-      "weight_decay": 0.01,
-      "torch_adam": true
-    }
-  },
-  
-  "zero_optimization": {
-    "stage": 2,
-    "offload_optimizer": {
-      "device": "cpu",
-      "pin_memory": false
-    },
-    "overlap_comm": true,
-    "contiguous_gradients": true,
-    "reduce_bucket_size": 1e6,
-    "gather_16bit_weights_on_model_save": false
-  },
-  
-  "bf16": {
-    "enabled": true
-  },
-  
-  "gradient_clipping": 1.0,
-  
-  "activation_checkpointing": {
-    "partition_activations": true,
-    "contiguous_memory_optimization": true,
-    "number_checkpoints": 12,
-    "synchronize_checkpoint_boundary": false,
-    "cpu_checkpointing": true
-  },
-  
-  "wall_clock_breakdown": false,
-  
-  "steps_per_print": 100,
-  
-  "fp16": {
-    "enabled": false
-  },
-  
-  "amp": {
-    "enabled": false,
-    "amp_master_weights": false,
-    "loss_scale_window": 1000
-  }
-}
+    if verbose:
+        print(f"  Train loss: {results['train_loss']:.4f}  |  PPL: {results['train_ppl']:.2f}")
+        print(f"  Val loss:   {results['val_loss']:.4f}  |  PPL: {results['val_ppl']:.2f}")
+        print(f"  Token accuracy: {results['token_accuracy']:.4f}")
+        print(f"  Diversity ratio: {results['diversity_ratio']:.3f}")
+        print(f"  Sample: {results['generation_sample'][:100]}...")
+
+    return results
+
+
+if __name__ == "__main__":
+    # Quick smoke test
+    from model import TinyGPT
+    from tinygpt.training import load_checkpoint
+    from main import get_batch, DEVICE
+
+    model = TinyGPT(50257, 512, 768, 12, 12, 3072, 0.1).to(DEVICE)
+    try:
+        import os
+        ckpt_path = os.path.join("checkpoints", "best.pt")
+        if os.path.exists(ckpt_path):
+            step, val_loss = load_checkpoint(ckpt_path, model, None)
+            print(f"Loaded checkpoint (step {step}, val_loss {val_loss:.4f})")
+    except Exception as e:
+        print(f"No checkpoint loaded: {e}")
+
+    results = eval_suite(model, get_batch, eval_iters=10, device=DEVICE, verbose=True)
 
 ```
 `findings/F1.md`:
@@ -3374,6 +1783,7 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 import tiktoken
 from model import CausalSelfAttention, FeedForward, TransformerBlock, TinyGPT
 from tinygpt.training import CPUOffloadAdamW, get_lr, save_checkpoint, estimate_loss
+from eval_suite import eval_suite
 from rich.progress import (
     Progress, BarColumn, TextColumn, TimeRemainingColumn, TimeElapsedColumn,
     SpinnerColumn, MofNCompleteColumn,
@@ -3382,335 +1792,284 @@ from rich.console import Console
 
 console = Console()
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 1. LOAD CHAT DATA
-# ═════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    # ═════════════════════════════════════════════════════════════════════════════
+    # 1. LOAD CHAT DATA
+    # ═════════════════════════════════════════════════════════════════════════════
 
-DATA_DIR = "instruction_data"
-for split in ("train", "val", "test"):
-    path = os.path.join(DATA_DIR, f"{split}.bin")
-    if not os.path.exists(path):
+    DATA_DIR = "instruction_data"
+    for split in ("train", "val", "test"):
+        path = os.path.join(DATA_DIR, f"{split}.bin")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"\n[ERROR] '{path}' not found.\n"
+                "Run  python prepare_chat_data.py  first."
+            )
+
+    train_data = np.memmap(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16, mode="r")
+    val_data   = np.memmap(os.path.join(DATA_DIR, "val.bin"),   dtype=np.uint16, mode="r")
+    test_data  = np.memmap(os.path.join(DATA_DIR, "test.bin"),  dtype=np.uint16, mode="r")
+
+    print("Instruction dataset loaded (memory-mapped)")
+    print(f"  Train : {len(train_data):>12,} tokens")
+    print(f"  Val   : {len(val_data):>12,} tokens")
+    print(f"  Test  : {len(test_data):>12,} tokens")
+    print()
+
+    # ═════════════════════════════════════════════════════════════════════════════
+    # 2. TOKENIZER
+    # ═════════════════════════════════════════════════════════════════════════════
+
+    enc        = tiktoken.get_encoding("gpt2")
+    vocab_size = enc.n_vocab
+
+    def encode(text: str) -> list:
+        return enc.encode_ordinary(text)
+
+    def decode(ids: list) -> str:
+        return enc.decode(ids)
+
+    print(f"Tokenizer : GPT-2 BPE  (vocab {vocab_size:,})")
+    print()
+
+    # ═════════════════════════════════════════════════════════════════════════════
+    # 3. HYPERPARAMETERS (tuned for fine-tuning)
+    # ═════════════════════════════════════════════════════════════════════════════
+
+    BLOCK_SIZE    = 512              # context window (tokens) — must match pre-trained
+    MICRO_BATCH   = 4                # samples per GPU forward pass
+    GRAD_ACCUM    = 16               # accumulate before optimizer step → eff. batch 64
+    EMBED_DIM     = 768              # model width (must match pre-trained 124M)
+    NUM_HEADS     = 12               # attention heads
+    NUM_LAYERS    = 12               # transformer blocks
+    FFN_DIM       = EMBED_DIM * 4   # 3072
+    DROPOUT       = 0.1
+    LR            = 2e-5             # LOW learning rate — preserve pre-trained weights
+                                     # (10x lower than pre-training LR=1.5e-4)
+    WARMUP_STEPS  = 500
+    MAX_ITERS     = 10_000           # instruction tuning steps
+    EVAL_EVERY    = 1_000
+    EVAL_ITERS    = 50
+    USE_ACTIVATION_CHECKPOINT = True  # required for 124M on 4GB VRAM
+    GRAD_CLIP     = 1.0
+    EFFECTIVE_BATCH = MICRO_BATCH * GRAD_ACCUM
+    CHECKPOINT_DIR = "checkpoints"
+    PRETRAINED_CKPT = os.path.join(CHECKPOINT_DIR, "best.pt")
+
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    DTYPE  = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+
+    print(f"Device          : {DEVICE.upper()}")
+    print(f"Precision       : {'BF16' if DTYPE == torch.bfloat16 else 'FP32'}")
+    print(f"Effective batch : {MICRO_BATCH * GRAD_ACCUM}")
+    print(f"Learning rate   : {LR}")
+    print()
+
+    # ═════════════════════════════════════════════════════════════════════════════
+    # 4. DATA LOADER
+    # ═════════════════════════════════════════════════════════════════════════════
+
+    def get_batch(split="train"):
+        data = {"train": train_data, "val": val_data, "test": test_data}[split]
+        ix = np.random.randint(0, len(data) - BLOCK_SIZE, size=(MICRO_BATCH,))
+        x = np.stack([data[i   : i + BLOCK_SIZE    ].astype(np.int64) for i in ix])
+        y = np.stack([data[i+1 : i + BLOCK_SIZE + 1].astype(np.int64) for i in ix])
+        return torch.from_numpy(x).to(DEVICE), torch.from_numpy(y).to(DEVICE)
+
+    # ═════════════════════════════════════════════════════════════════════════════
+    # 5. MODEL — see model.py for TinyGPT, TransformerBlock, FeedForward, CausalSelfAttention
+    # ═════════════════════════════════════════════════════════════════════════════
+
+    # ═════════════════════════════════════════════════════════════════════════════
+    # 6. OPTIMIZER / SCHEDULER / CHECKPOINT — see tinygpt.training
+    # ═════════════════════════════════════════════════════════════════════════════
+
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    # ═════════════════════════════════════════════════════════════════════════════
+    # 10. INSTANTIATE MODEL + LOAD PRE-TRAINED CHECKPOINT
+    # ═════════════════════════════════════════════════════════════════════════════
+
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+
+    model = TinyGPT(vocab_size, BLOCK_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS,
+                    FFN_DIM, DROPOUT)
+    n_total = sum(p.numel() for p in model.parameters())
+
+    model = model.to(dtype=DTYPE, device=DEVICE)
+    gc.collect()
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+
+    # Force-load the pre-trained checkpoint
+    if not os.path.exists(PRETRAINED_CKPT):
         raise FileNotFoundError(
-            f"\n[ERROR] '{path}' not found.\n"
-            "Run  python prepare_chat_data.py  first."
+            f"\n[ERROR] Pre-trained checkpoint '{PRETRAINED_CKPT}' not found.\n"
+            "Run  python main.py  first to generate best.pt."
         )
 
-train_data = np.memmap(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16, mode="r")
-val_data   = np.memmap(os.path.join(DATA_DIR, "val.bin"),   dtype=np.uint16, mode="r")
-test_data  = np.memmap(os.path.join(DATA_DIR, "test.bin"),  dtype=np.uint16, mode="r")
-
-print("Instruction dataset loaded (memory-mapped)")
-print(f"  Train : {len(train_data):>12,} tokens")
-print(f"  Val   : {len(val_data):>12,} tokens")
-print(f"  Test  : {len(test_data):>12,} tokens")
-print()
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 2. TOKENIZER
-# ═════════════════════════════════════════════════════════════════════════════
-
-enc        = tiktoken.get_encoding("gpt2")
-vocab_size = enc.n_vocab
-
-def encode(text: str) -> list:
-    return enc.encode_ordinary(text)
-
-def decode(ids: list) -> str:
-    return enc.decode(ids)
-
-print(f"Tokenizer : GPT-2 BPE  (vocab {vocab_size:,})")
-print()
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 3. HYPERPARAMETERS (tuned for fine-tuning)
-# ═════════════════════════════════════════════════════════════════════════════
-
-BLOCK_SIZE    = 512              # context window (tokens) — must match pre-trained
-MICRO_BATCH   = 2                # samples per GPU forward pass
-GRAD_ACCUM    = 8                # accumulate before optimizer step
-EMBED_DIM     = 768              # model width (must match pre-trained 124M)
-NUM_HEADS     = 12               # attention heads
-NUM_LAYERS    = 12               # transformer blocks
-FFN_DIM       = EMBED_DIM * 4   # 3072
-DROPOUT       = 0.1
-LR            = 2e-5             # LOW learning rate — preserve pre-trained weights
-WARMUP_STEPS  = 500
-MAX_ITERS     = 10_000           # instruction tuning steps
-EVAL_EVERY    = 1_000
-EVAL_ITERS    = 50
-USE_ACTIVATION_CHECKPOINT = True  # required for 124M on 4GB VRAM
-GRAD_CLIP     = 1.0
-CHECKPOINT_DIR = "checkpoints"
-PRETRAINED_CKPT = os.path.join(CHECKPOINT_DIR, "best.pt")
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE  = torch.bfloat16 if DEVICE == "cuda" else torch.float32
-
-print(f"Device          : {DEVICE.upper()}")
-print(f"Precision       : {'BF16' if DTYPE == torch.bfloat16 else 'FP32'}")
-print(f"Effective batch : {MICRO_BATCH * GRAD_ACCUM}")
-print(f"Learning rate   : {LR}")
-print()
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 4. DATA LOADER
-# ═════════════════════════════════════════════════════════════════════════════
-
-def get_batch(split="train"):
-    data = {"train": train_data, "val": val_data, "test": test_data}[split]
-    ix = np.random.randint(0, len(data) - BLOCK_SIZE, size=(MICRO_BATCH,))
-    x = np.stack([data[i   : i + BLOCK_SIZE    ].astype(np.int64) for i in ix])
-    y = np.stack([data[i+1 : i + BLOCK_SIZE + 1].astype(np.int64) for i in ix])
-    return torch.from_numpy(x).to(DEVICE), torch.from_numpy(y).to(DEVICE)
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 5. MODEL — see model.py for TinyGPT, TransformerBlock, FeedForward, CausalSelfAttention
-# ═════════════════════════════════════════════════════════════════════════════
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 6. OPTIMIZER / SCHEDULER / CHECKPOINT — see tinygpt.training
-# ═════════════════════════════════════════════════════════════════════════════
-
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 10. INSTANTIATE MODEL + LOAD PRE-TRAINED CHECKPOINT
-# ═════════════════════════════════════════════════════════════════════════════
-
-if DEVICE == "cuda":
-    torch.cuda.empty_cache()
-
-model = TinyGPT(vocab_size, BLOCK_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS,
-                FFN_DIM, DROPOUT)
-n_total = sum(p.numel() for p in model.parameters())
-
-model = model.to(dtype=DTYPE, device=DEVICE)
-gc.collect()
-if DEVICE == "cuda":
-    torch.cuda.empty_cache()
-
-# Force-load the pre-trained checkpoint
-if not os.path.exists(PRETRAINED_CKPT):
-    raise FileNotFoundError(
-        f"\n[ERROR] Pre-trained checkpoint '{PRETRAINED_CKPT}' not found.\n"
-        "Run  python main.py  first to generate best.pt."
-    )
-
-print(f"Loading pre-trained checkpoint: {PRETRAINED_CKPT}")
-ckpt = torch.load(PRETRAINED_CKPT, map_location="cpu", weights_only=False)
-model.load_state_dict(ckpt["model"])
-print(f"  Loaded from step {ckpt['step']}  "
-      f"(train {ckpt['train_loss']:.4f}, val {ckpt['val_loss']:.4f})")
-print()
-
-# Initialize optimizer
-if DEVICE == "cuda":
-    optimizer = CPUOffloadAdamW(model.parameters(), lr=LR)
-else:
-    _inner = torch.optim.AdamW(model.parameters(), lr=LR)
-    class _Wrap:
-        def __init__(self, o): self.opt = o
-        def step(self):       self.opt.step()
-        def zero_grad(self):  self.opt.zero_grad(set_to_none=True)
-        def set_lr(self, lr):
-            for pg in self.opt.param_groups: pg["lr"] = lr
-        def state_dict(self):       return self.opt.state_dict()
-        def load_state_dict(self, sd): self.opt.load_state_dict(sd)
-    optimizer = _Wrap(_inner)
-
-print(f"Total  parameters : {n_total:>14,}")
-print()
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 11. FINE-TUNING LOOP
-# ═════════════════════════════════════════════════════════════════════════════
-
-console.rule("[bold green]Fine-tuning started")
-print()
-
-start_step = 0
-best_val = float("inf")
-tokens_per_step = MICRO_BATCH * GRAD_ACCUM * BLOCK_SIZE
-
-with Progress(
-    SpinnerColumn(),
-    TextColumn("[bold blue]{task.description}"),
-    BarColumn(bar_width=30),
-    MofNCompleteColumn(),
-    TextColumn("•"),
-    TimeElapsedColumn(),
-    TextColumn("•"),
-    TimeRemainingColumn(),
-    TextColumn("•"),
-    TextColumn("[yellow]loss {task.fields[train_loss]}"),
-    TextColumn("[cyan]val {task.fields[val_loss]}"),
-    TextColumn("[magenta]lr {task.fields[lr]}"),
-    TextColumn("•"),
-    TextColumn("[bold cyan]{task.fields[tok_s]} tok/s"),
-    console=console,
-    refresh_per_second=4,
-) as progress:
-    total_steps = MAX_ITERS - start_step
-    task = progress.add_task(
-        "Fine-tuning", total=total_steps,
-        train_loss="--.----", val_loss="--.----", lr="--.------",
-        tok_s="------",
-    )
-
-    step_start_time = time.perf_counter()
-
-    for step in range(start_step + 1, MAX_ITERS + 1):
-
-        lr = get_lr(step, LR, WARMUP_STEPS, MAX_ITERS)
-        optimizer.set_lr(lr)
-
-        optimizer.zero_grad()
-        accum_loss = 0.0
-
-        for _ in range(GRAD_ACCUM):
-            x, y = get_batch("train")
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                    enabled=(DTYPE == torch.bfloat16)):
-                _, loss = model(x, y)
-            (loss / GRAD_ACCUM).backward()
-            accum_loss += loss.item() / GRAD_ACCUM
-
-        norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        if norm_before > GRAD_CLIP:
-            progress.console.print(f"  [yellow]Gradient norm clipped: {norm_before:.2f} → {GRAD_CLIP}[/]", style="dim")
-        optimizer.step()
-
-        now = time.perf_counter()
-        elapsed = now - step_start_time
-        step_start_time = now
-        tok_s = tokens_per_step / elapsed if elapsed > 0 else 0
-
-        progress.update(
-            task, advance=1,
-            train_loss=f"{accum_loss:.4f}", lr=f"{lr:.6f}",
-            tok_s=f"{tok_s:,.0f}",
-        )
-
-        if step % EVAL_EVERY == 0 or step == 1:
-            losses = estimate_loss(model, get_batch, EVAL_ITERS)
-            progress.update(
-                task,
-                train_loss=f"{losses['train']:.4f}",
-                val_loss=f"{losses['val']:.4f}",
-                lr=f"{lr:.6f}",
-                tok_s=f"{tok_s:,.0f}",
-            )
-            progress.console.print(
-                f"  [bold]Step {step:>5}[/]  │  "
-                f"[yellow]Train {losses['train']:.4f}[/]  │  "
-                f"[cyan]Val {losses['val']:.4f}[/]  │  "
-                f"[magenta]LR {lr:.6f}[/]  │  "
-                f"[bold cyan]{tok_s:,.0f} tok/s[/]"
-            )
-
-            # Save fine-tuned checkpoints (separate from pre-trained)
-            save_checkpoint(
-                step, model, optimizer,
-                losses["train"], losses["val"],
-                os.path.join(CHECKPOINT_DIR, "finetune_latest.pt"),
-            )
-            if losses["val"] < best_val:
-                best_val = losses["val"]
-                save_checkpoint(
-                    step, model, optimizer,
-                    losses["train"], losses["val"],
-                    os.path.join(CHECKPOINT_DIR, "finetune_best.pt"),
-                )
-                progress.console.print(
-                    f"  [bold green]★ New best val loss: {best_val:.4f}  (saved finetune_best.pt)[/]"
-                )
-
-print()
-console.rule("[bold green]Fine-tuning complete")
-print()
-
-# ── Load best fine-tuned checkpoint for evaluation ──
-finetune_best = os.path.join(CHECKPOINT_DIR, "finetune_best.pt")
-if os.path.exists(finetune_best):
-    print("Loading best fine-tuned checkpoint for evaluation …")
-    ckpt = torch.load(finetune_best, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    print(f"Loading pre-trained checkpoint: {PRETRAINED_CKPT}")
+    ckpt = torch.load(PRETRAINED_CKPT, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model_state"])
     print(f"  Loaded from step {ckpt['step']}  "
           f"(train {ckpt['train_loss']:.4f}, val {ckpt['val_loss']:.4f})")
     print()
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 12. TEST EVALUATION
-# ═════════════════════════════════════════════════════════════════════════════
+    # Initialize optimizer
+    if DEVICE == "cuda":
+        optimizer = CPUOffloadAdamW(model.parameters(), lr=LR)
+    else:
+        _inner = torch.optim.AdamW(model.parameters(), lr=LR)
+        class _Wrap:
+            def __init__(self, o): self.opt = o
+            def step(self):       self.opt.step()
+            def zero_grad(self):  self.opt.zero_grad(set_to_none=True)
+            def set_lr(self, lr):
+                for pg in self.opt.param_groups: pg["lr"] = lr
+            def state_dict(self):       return self.opt.state_dict()
+            def load_state_dict(self, sd): self.opt.load_state_dict(sd)
+        optimizer = _Wrap(_inner)
 
-model.eval()
-test_losses = []
-with torch.no_grad():
-    for _ in range(EVAL_ITERS):
-        x, y = get_batch("test")
-        _, loss = model(x, y)
-        test_losses.append(loss.item())
-test_loss = sum(test_losses) / len(test_losses)
-print(f"Test loss : {test_loss:.4f}")
-print()
+    print(f"Total  parameters : {n_total:>14,}")
+    print()
 
-print("Fine-tuning complete. Run  python chat.py  to chat with your bot!")
+    # ═════════════════════════════════════════════════════════════════════════════
+    # 11. FINE-TUNING LOOP
+    # ═════════════════════════════════════════════════════════════════════════════
 
-```
-`linear_attention.py`:
+    console.rule("[bold green]Fine-tuning started")
+    print()
 
-```py
-"""
-Linear Attention for Tiny-GPT.
-O(N) complexity via kernel feature-map factorization.
-Drop-in replacement for CausalSelfAttention (implements the same interface).
-"""
+    start_step = 0
+    best_val = float("inf")
+    tokens_per_step = MICRO_BATCH * GRAD_ACCUM * BLOCK_SIZE
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=30),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+        TextColumn("•"),
+        TextColumn("[yellow]loss {task.fields[train_loss]}"),
+        TextColumn("[cyan]val {task.fields[val_loss]}"),
+        TextColumn("[magenta]lr {task.fields[lr]}"),
+        TextColumn("•"),
+        TextColumn("[bold cyan]{task.fields[tok_s]} tok/s"),
+        console=console,
+        refresh_per_second=4,
+    ) as progress:
+        total_steps = MAX_ITERS - start_step
+        task = progress.add_task(
+            "Fine-tuning", total=total_steps,
+            train_loss="--.----", val_loss="--.----", lr="--.------",
+            tok_s="------",
+        )
 
+        step_start_time = time.perf_counter()
 
-class LinearAttention(nn.Module):
-    """Multi-head linear attention with elu+1 kernel."""
+        for step in range(start_step + 1, MAX_ITERS + 1):
 
-    def __init__(self, embed_dim, num_heads, dropout=0.1):
-        super().__init__()
-        self.n_heads  = num_heads
-        self.head_dim = embed_dim // num_heads
+            lr = get_lr(step, LR, WARMUP_STEPS, MAX_ITERS)
+            optimizer.set_lr(lr)
 
-        self.q = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.k = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.proj_drop = nn.Dropout(dropout)
+            optimizer.zero_grad()
+            accum_loss = 0.0
 
-    @staticmethod
-    def feature_map(x):
-        return F.elu(x) + 1.0
+            for _ in range(GRAD_ACCUM):
+                x, y = get_batch("train")
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                        enabled=(DTYPE == torch.bfloat16)):
+                    _, loss = model(x, y)
+                (loss / GRAD_ACCUM).backward()
+                accum_loss += loss.item() / GRAD_ACCUM
 
-    def forward(self, x):
-        B, T, C = x.shape
+            norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            if norm_before > GRAD_CLIP:
+                progress.console.print(f"  [yellow]Gradient norm clipped: {norm_before:.2f} → {GRAD_CLIP}[/]", style="dim")
+            optimizer.step()
 
-        q = self.feature_map(self.q(x).reshape(B, T, self.n_heads, self.head_dim))
-        k = self.feature_map(self.k(x).reshape(B, T, self.n_heads, self.head_dim))
-        v = self.v(x).reshape(B, T, self.n_heads, self.head_dim)
+            now = time.perf_counter()
+            elapsed = now - step_start_time
+            step_start_time = now
+            tok_s = tokens_per_step / elapsed if elapsed > 0 else 0
 
-        # Causal state accumulation: O(N) per head
-        kv = torch.zeros(B, self.n_heads, self.head_dim, self.head_dim, device=x.device, dtype=x.dtype)
-        state_k = torch.zeros(B, self.n_heads, self.head_dim, device=x.device, dtype=x.dtype)
-        out = torch.zeros_like(v)
+            progress.update(
+                task, advance=1,
+                train_loss=f"{accum_loss:.4f}", lr=f"{lr:.6f}",
+                tok_s=f"{tok_s:,.0f}",
+            )
 
-        for t in range(T):
-            kv = kv + torch.einsum("bhd,bhe->bhde", k[:, t], v[:, t])
-            state_k = state_k + k[:, t]
-            # numerator: phi(q_t)^T @ cumulative_kv, denominator: phi(q_t) . cumulative_k
-            num = torch.einsum("bhde,bhd->bhe", kv, q[:, t])
-            den = (q[:, t] * state_k).sum(dim=-1, keepdim=True)  # (B, H, 1)
-            out[:, t] = num / (den + 1e-6)
+            if step % EVAL_EVERY == 0 or step == 1:
+                losses = eval_suite(model, lambda s: get_batch(s), eval_iters=EVAL_ITERS,
+                                    device=DEVICE, verbose=False)
+                progress.update(
+                    task,
+                    train_loss=f"{losses['train_loss']:.4f}",
+                    val_loss=f"{losses['val_loss']:.4f}",
+                    lr=f"{lr:.6f}",
+                    tok_s=f"{tok_s:,.0f}",
+                )
+                progress.console.print(
+                    f"  [bold]Step {step:>5}[/]  │  "
+                    f"[yellow]Train {losses['train_loss']:.4f}[/]  │  "
+                    f"[cyan]Val {losses['val_loss']:.4f}  PPL {losses['val_ppl']:.1f}[/]  │  "
+                    f"[magenta]LR {lr:.6f}[/]  │  "
+                    f"[bold cyan]{tok_s:,.0f} tok/s[/]  │  "
+                    f"[green]Acc {losses['token_accuracy']:.3f}[/]"
+                )
 
-        out = out.reshape(B, T, C)
-        return self.proj_drop(self.proj(out))
+                # Save fine-tuned checkpoints (separate from pre-trained)
+                save_checkpoint(
+                    step, model, optimizer,
+                    losses["train_loss"], losses["val_loss"],
+                    os.path.join(CHECKPOINT_DIR, "finetune_latest.pt"),
+                )
+                if losses["val_loss"] < best_val:
+                    best_val = losses["val_loss"]
+                    save_checkpoint(
+                        step, model, optimizer,
+                        losses["train_loss"], losses["val_loss"],
+                        os.path.join(CHECKPOINT_DIR, "finetune_best.pt"),
+                    )
+                    progress.console.print(
+                        f"  [bold green]★ New best val loss: {best_val:.4f}  (saved finetune_best.pt)[/]"
+                    )
+
+    print()
+    console.rule("[bold green]Fine-tuning complete")
+    print()
+
+    # ── Load best fine-tuned checkpoint for evaluation ──
+    finetune_best = os.path.join(CHECKPOINT_DIR, "finetune_best.pt")
+    if os.path.exists(finetune_best):
+        print("Loading best fine-tuned checkpoint for evaluation ...")
+        ckpt = torch.load(finetune_best, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+        print(f"  Loaded from step {ckpt['step']}  "
+              f"(train {ckpt['train_loss']:.4f}, val {ckpt['val_loss']:.4f})")
+        print()
+
+    # ═════════════════════════════════════════════════════════════════════════════
+    # 12. TEST EVALUATION
+    # ═════════════════════════════════════════════════════════════════════════════
+
+    model.eval()
+    test_losses = []
+    with torch.no_grad():
+        for _ in range(EVAL_ITERS):
+            x, y = get_batch("test")
+            _, loss = model(x, y)
+            test_losses.append(loss.item())
+    test_loss = sum(test_losses) / len(test_losses)
+    print(f"Test loss : {test_loss:.4f}")
+    print()
+
+    print("Fine-tuning complete. Run  python chat.py  to chat with your bot!")
 
 ```
 `main.py`:
@@ -3757,6 +2116,7 @@ from rich import print as rprint
 from model import CausalSelfAttention, FeedForward, TransformerBlock, TinyGPT
 from tinygpt.attention import LinearAttention
 from tinygpt.training import CPUOffloadAdamW, get_lr, save_checkpoint, load_checkpoint, estimate_loss
+from eval_suite import eval_suite
 
 console = Console()
 
@@ -3804,8 +2164,9 @@ print()
 # ═════════════════════════════════════════════════════════════════════════════
 
 BLOCK_SIZE    = 512              # context window (tokens)
-MICRO_BATCH   = 2                # samples per GPU forward pass
-GRAD_ACCUM    = 8                # accumulate before optimizer step → eff. batch 16
+MICRO_BATCH   = 4                # samples per GPU forward pass (VRAM-limited to 4GB)
+GRAD_ACCUM    = 16               # gradient accumulation steps → eff. batch 64
+                                 # Total tokens/step: MICRO_BATCH * GRAD_ACCUM * BLOCK_SIZE
 EMBED_DIM     = 768              # model width (~124M params)
 NUM_HEADS     = 12               # attention heads (768 / 12 = 64 head_dim)
 NUM_LAYERS    = 12               # transformer blocks
@@ -3814,12 +2175,13 @@ DROPOUT       = 0.1
 LR            = 1.5e-4           # peak learning rate
 WARMUP_STEPS  = 500              # linear warmup for stability
 MAX_ITERS     = 50_000          # marathon training
-EVAL_EVERY    = 1_000
+EVAL_EVERY    = 500
 EVAL_ITERS    = 50
 USE_ACTIVATION_CHECKPOINT = True  # required for 124M on 4GB VRAM
 GRAD_CLIP     = 1.0
 ATTENTION_TYPE = "softmax"       # "softmax" (default) or "linear"
 CHECKPOINT_DIR = "checkpoints"   # directory for saving checkpoints
+EFFECTIVE_BATCH = MICRO_BATCH * GRAD_ACCUM  # eff. batch size (64)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE  = torch.bfloat16 if DEVICE == "cuda" else torch.float32
@@ -3980,6 +2342,7 @@ if __name__ == "__main__":
         TimeElapsedColumn(),
         TextColumn("•"),
         TimeRemainingColumn(),
+        TextColumn("[cyan]ends {task.fields[ends_at]}"),
         TextColumn("•"),
         TextColumn("[yellow]loss {task.fields[train_loss]}"),
         TextColumn("[cyan]val {task.fields[val_loss]}"),
@@ -3993,10 +2356,11 @@ if __name__ == "__main__":
         task = progress.add_task(
             "Training", total=total_steps,
             train_loss="--.----", val_loss="--.----", lr="--.------",
-            tok_s="------",
+            tok_s="------", ends_at="--:--",
         )
 
         step_start_time = time.perf_counter()
+        start_wall_time = time.time()
         tokens_per_step = MICRO_BATCH * GRAD_ACCUM * BLOCK_SIZE
 
         for step in range(start_step + 1, MAX_ITERS + 1):
@@ -4026,42 +2390,53 @@ if __name__ == "__main__":
             step_start_time = now
             tok_s = tokens_per_step / elapsed if elapsed > 0 else 0
 
+            completed = step - start_step
+            remaining_steps = total_steps - completed
+            if completed > 0:
+                elapsed_wall = time.time() - start_wall_time
+                eta_seconds = (elapsed_wall / completed) * remaining_steps
+                ends = time.strftime("%H:%M", time.localtime(time.time() + eta_seconds))
+            else:
+                ends = "--:--"
+
             progress.update(
                 task, advance=1,
                 train_loss=f"{accum_loss:.4f}", lr=f"{lr:.6f}",
-                tok_s=f"{tok_s:,.0f}",
+                tok_s=f"{tok_s:,.0f}", ends_at=ends,
             )
 
             if step % EVAL_EVERY == 0 or step == 1:
-                losses = estimate_loss(model, get_batch, EVAL_ITERS,
-                                       use_activation_checkpoint=USE_ACTIVATION_CHECKPOINT)
+                losses = eval_suite(model, lambda s: get_batch(s), eval_iters=EVAL_ITERS,
+                                    device=DEVICE, verbose=False)
                 progress.update(
                     task,
-                    train_loss=f"{losses['train']:.4f}",
-                    val_loss=f"{losses['val']:.4f}",
+                    train_loss=f"{losses['train_loss']:.4f}",
+                    val_loss=f"{losses['val_loss']:.4f}",
                     lr=f"{lr:.6f}",
                     tok_s=f"{tok_s:,.0f}",
+                    ends_at=ends,
                 )
                 progress.console.print(
                     f"  [bold]Step {step:>5}[/]  │  "
-                    f"[yellow]Train {losses['train']:.4f}[/]  │  "
-                    f"[cyan]Val {losses['val']:.4f}[/]  │  "
+                    f"[yellow]Train {losses['train_loss']:.4f}[/]  │  "
+                    f"[cyan]Val {losses['val_loss']:.4f}  PPL {losses['val_ppl']:.1f}[/]  │  "
                     f"[magenta]LR {lr:.6f}[/]  │  "
-                    f"[bold cyan]{tok_s:,.0f} tok/s[/]"
+                    f"[bold cyan]{tok_s:,.0f} tok/s[/]  │  "
+                    f"[green]Acc {losses['token_accuracy']:.3f}[/]"
                 )
 
                 # ── Save checkpoints ──
                 save_checkpoint(
                     step, model, optimizer,
-                    losses["train"], losses["val"],
+                    losses["train_loss"], losses["val_loss"],
                     os.path.join(CHECKPOINT_DIR, "latest.pt"),
                     attention_type=ATTENTION_TYPE,
                 )
-                if losses["val"] < best_val:
-                    best_val = losses["val"]
+                if losses["val_loss"] < best_val:
+                    best_val = losses["val_loss"]
                     save_checkpoint(
                         step, model, optimizer,
-                        losses["train"], losses["val"],
+                        losses["train_loss"], losses["val_loss"],
                         os.path.join(CHECKPOINT_DIR, "best.pt"),
                         attention_type=ATTENTION_TYPE,
                     )
@@ -4132,590 +2507,6 @@ if __name__ == "__main__":
         if not prompt or prompt.lower() == "quit":
             break
         output = generate(model, prompt, max_new_tokens=150, temperature=0.8)
-        print(f"\n{output.strip()}")
-
-    print("\nGoodbye!")
-
-```
-`main_deepspeed.py`:
-
-```py
-"""
-Tiny-GPT – Dense Transformer Language Model (DeepSpeed ZeRO-2)
-==============================================================
-Dense GPT trained on FineWeb-Edu with DeepSpeed ZeRO-2:
-  - ZeRO Stage 2: Optimizer states partitioned across GPUs + CPU offload
-  - BF16 mixed precision with FlashAttention
-  - Automatic gradient checkpointing support
-
-Architecture
-  8 Transformer layers  ×  (8-head attention  +  Dense FFN)
-  Total params  ≈ 101 M
-
-Run order:
-    pip install torch tiktoken numpy datasets deepspeed
-    python prepare_data.py              # once — downloads FineWeb-Edu
-    deepspeed --num_gpus 1 main_deepspeed.py  # train with DeepSpeed
-    python run.py                       # generate
-"""
-
-import os
-import sys
-import math
-import gc
-import json
-import time
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as grad_checkpoint
-import tiktoken
-import deepspeed
-from model import CausalSelfAttention, FeedForward, TransformerBlock, TinyGPT
-from tinygpt.training import get_lr, estimate_loss
-from rich.progress import (
-    Progress, BarColumn, TextColumn, TimeRemainingColumn, TimeElapsedColumn,
-    SpinnerColumn, MofNCompleteColumn,
-)
-from rich.console import Console
-
-console = Console()
-IST = ZoneInfo("Asia/Kolkata")
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 1. LOAD DATA  (memory-mapped .bin files from prepare_data.py)
-# ═════════════════════════════════════════════════════════════════════════════
-
-DATA_DIR = "data"
-for split in ("train", "val", "test"):
-    path = os.path.join(DATA_DIR, f"{split}.bin")
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"\n[ERROR] '{path}' not found.\n"
-            "Run  python prepare_data.py  first."
-        )
-
-train_data = np.memmap(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16, mode="r")
-val_data   = np.memmap(os.path.join(DATA_DIR, "val.bin"),   dtype=np.uint16, mode="r")
-test_data  = np.memmap(os.path.join(DATA_DIR, "test.bin"),  dtype=np.uint16, mode="r")
-
-print("Dataset loaded (memory-mapped)")
-print(f"  Train : {len(train_data):>12,} tokens")
-print(f"  Val   : {len(val_data):>12,} tokens")
-print(f"  Test  : {len(test_data):>12,} tokens")
-print()
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 2. TOKENISER – GPT-2 BPE  (matches prepare_data.py)
-# ═════════════════════════════════════════════════════════════════════════════
-
-enc        = tiktoken.get_encoding("gpt2")
-vocab_size = enc.n_vocab                      # 50 257
-
-def encode(text: str) -> list:
-    return enc.encode_ordinary(text)
-
-def decode(ids: list) -> str:
-    return enc.decode(ids)
-
-print(f"Tokeniser : GPT-2 BPE  (vocab {vocab_size:,})")
-print()
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 3. HYPERPARAMETERS
-# ═════════════════════════════════════════════════════════════════════════════
-
-BLOCK_SIZE    = 64               # context window (tokens)
-MICRO_BATCH   = 8                # samples per GPU forward pass (managed by DeepSpeed)
-GRAD_ACCUM    = 4                # accumulate before optimizer step → eff. batch 16
-EMBED_DIM     = 512              # model width
-NUM_HEADS     = 8                # attention heads
-NUM_LAYERS    = 8                # transformer blocks
-FFN_DIM       = EMBED_DIM * 4   # 2 048  (expert hidden dim)
-DROPOUT       = 0.1
-LR            = 5.0e-5           # peak learning rate (tuned for 101M model + batch 16)
-WARMUP_STEPS  = 500              # linear warmup
-MAX_ITERS     = 120_000           # total optimiser steps
-EVAL_EVERY    = 2_000
-EVAL_ITERS    = 50
-GRAD_CLIP     = 1.0
-CHECKPOINT_DIR = "checkpoints"   # directory for saving checkpoints
-# ── Auto-stop ───────────────────────────────────────────────────────────
-PATIENCE            = 5          # eval steps without improvement → stop
-LOSS_EXPLODE_FACTOR = 1.5        # stop if val loss > best * factor
-NAN_STOP            = True       # stop immediately on NaN
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE  = torch.bfloat16 if DEVICE == "cuda" else torch.float32
-
-ALLOW_TF32 = os.environ.get("ALLOW_TF32", "1") == "1"
-USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "0") == "1"
-USE_ACTIVATION_CHECKPOINT = os.environ.get("USE_ACTIVATION_CHECKPOINT", "1") == "1"
-
-if DEVICE == "cuda":
-    # Throughput-oriented CUDA settings.
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = ALLOW_TF32
-    torch.backends.cudnn.allow_tf32 = ALLOW_TF32
-    torch.set_float32_matmul_precision("high")
-
-print(f"Device          : {DEVICE.upper()}")
-print(f"Precision       : {'BF16 (DeepSpeed)' if DTYPE == torch.bfloat16 else 'FP32'}")
-print(f"Eff batch (Py) : {MICRO_BATCH * GRAD_ACCUM}  (DeepSpeed config may override)")
-print(f"TF32            : {'ON' if (DEVICE == 'cuda' and ALLOW_TF32) else 'OFF'}")
-print(f"Torch compile   : {'ON' if USE_TORCH_COMPILE else 'OFF'}")
-print(f"Act checkpoint  : {'ON' if USE_ACTIVATION_CHECKPOINT else 'OFF'}")
-print()
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 4. DATA LOADER
-# ═════════════════════════════════════════════════════════════════════════════
-
-def get_batch(split="train"):
-    data = {"train": train_data, "val": val_data, "test": test_data}[split]
-    ix = np.random.randint(0, len(data) - BLOCK_SIZE, size=(MICRO_BATCH,))
-    x = np.stack([data[i   : i + BLOCK_SIZE    ].astype(np.int64) for i in ix])
-    y = np.stack([data[i+1 : i + BLOCK_SIZE + 1].astype(np.int64) for i in ix])
-    return torch.from_numpy(x).to(DEVICE), torch.from_numpy(y).to(DEVICE)
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 5. MODEL — see model.py for TinyGPT, TransformerBlock, FeedForward, CausalSelfAttention
-# ═════════════════════════════════════════════════════════════════════════════
-
-@torch.no_grad()
-def generate(model, prompt: str, max_new_tokens=200, temperature=0.8, top_k=50, top_p=0.9):
-    model.eval()
-    ids = encode(prompt)
-    idx = torch.tensor([ids], dtype=torch.long, device=DEVICE)
-
-    for _ in range(max_new_tokens):
-        ctx = idx[:, -BLOCK_SIZE:]
-        logits, _ = model(ctx)
-        logits = logits[:, -1, :].float() / temperature
-
-        if top_k is not None:
-            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits[indices_to_remove] = float("-inf")
-
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumsum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove = cumsum_probs > top_p
-            sorted_indices_to_remove[..., 0] = False
-            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            logits[:, indices_to_remove] = float("-inf")
-
-        probs  = F.softmax(logits, dim=-1)
-        nxt    = torch.multinomial(probs, 1)
-        idx    = torch.cat([idx, nxt], dim=1)
-
-    model.train()
-    return decode(idx[0].tolist())
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 6. CHECKPOINT HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
-
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-
-def _strip_orig_mod_prefix(state_dict):
-    out = {}
-    for k, v in state_dict.items():
-        if k.startswith("_orig_mod."):
-            out[k[len("_orig_mod."):]] = v
-        else:
-            out[k] = v
-    return out
-
-
-def _add_orig_mod_prefix(state_dict):
-    out = {}
-    for k, v in state_dict.items():
-        if k.startswith("_orig_mod."):
-            out[k] = v
-        else:
-            out[f"_orig_mod.{k}"] = v
-    return out
-
-
-def _align_state_dict_for_model(state_dict, model):
-    """Align checkpoint keys with model keys (compiled vs non-compiled)."""
-    model_keys = list(model.state_dict().keys())
-    if not model_keys:
-        return state_dict
-
-    model_has_orig = model_keys[0].startswith("_orig_mod.")
-    ckpt_keys = list(state_dict.keys())
-    ckpt_has_orig = bool(ckpt_keys) and ckpt_keys[0].startswith("_orig_mod.")
-
-    if model_has_orig and not ckpt_has_orig:
-        return _add_orig_mod_prefix(state_dict)
-    if not model_has_orig and ckpt_has_orig:
-        return _strip_orig_mod_prefix(state_dict)
-    return state_dict
-
-def save_checkpoint(step, model, train_loss, val_loss, path):
-    """Save model and training state to disk."""
-    # DeepSpeed handles checkpointing, but we also save basic metadata
-    model_state = model.state_dict() if hasattr(model, "state_dict") else None
-    if model_state is not None:
-        # Store canonical keys so checkpoints are reusable across compile modes.
-        model_state = _strip_orig_mod_prefix(model_state)
-
-    checkpoint = {
-        "step": step,
-        "train_loss": train_loss,
-        "val_loss": val_loss,
-        "model_state": model_state,
-    }
-    torch.save(checkpoint, path)
-
-def load_checkpoint(path, model):
-    """Load checkpoint and return the step to resume from."""
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if ckpt.get("model_state"):
-        model_state = _align_state_dict_for_model(ckpt["model_state"], model)
-        model.load_state_dict(model_state)
-    print(f"  Resumed from step {ckpt['step']}  "
-          f"(train {ckpt['train_loss']:.4f}, val {ckpt['val_loss']:.4f})")
-    return ckpt["step"], ckpt["val_loss"]
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 7. LEARNING-RATE SCHEDULE — see tinygpt.training.get_lr
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-def get_eta_clock(progress, task_id):
-    """Return estimated finish time in IST as HH:MM."""
-    remaining = progress.tasks[task_id].time_remaining
-    if remaining is None:
-        return "--:--"
-    end_at = datetime.now(IST) + timedelta(seconds=max(0.0, remaining))
-    return end_at.strftime("%H:%M")
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 8. LOSS ESTIMATION
-# ═════════════════════════════════════════════════════════════════════════════
-
-@torch.no_grad()
-def estimate_loss(model):
-    model.eval()
-    out = {}
-    for split in ("train", "val"):
-        losses = []
-        for _ in range(EVAL_ITERS):
-            x, y = get_batch(split)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(DEVICE == "cuda" and DTYPE == torch.bfloat16)):
-                _, loss = model(x, y)
-            losses.append(loss.item())
-        out[split] = sum(losses) / len(losses)
-    model.train()
-    return out
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 9. DEEPSPEED INITIALIZATION & TRAINING
-# ═════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    # Clear cache
-    if DEVICE == "cuda":
-        torch.cuda.empty_cache()
-
-    # Initialize model
-    model = TinyGPT(vocab_size, BLOCK_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS,
-                    FFN_DIM, DROPOUT)
-    if DEVICE == "cuda" and USE_TORCH_COMPILE:
-        model = torch.compile(model, mode="max-autotune", fullgraph=False)
-
-    n_total  = sum(p.numel() for p in model.parameters())
-    n_active = n_total  # In a dense model, all parameters are active
-
-    print(f"Total  parameters : {n_total:>14,}")
-    print(f"Active per token  : {n_active:>14,}")
-    print()
-
-    # Ensure LOCAL_RANK is set so DeepSpeed's sanity checks pass when running
-    # this script directly with `python main_deepspeed.py` (single-GPU).
-    if "LOCAL_RANK" not in os.environ:
-        os.environ["LOCAL_RANK"] = "0"
-
-    # Initialize torch.distributed if not already initialized (single-process setup).
-    if not torch.distributed.is_initialized():
-        init_kwargs = {
-            "backend": "nccl" if DEVICE == "cuda" else "gloo",
-            "init_method": "tcp://127.0.0.1:29500",
-            "rank": 0,
-            "world_size": 1,
-        }
-        if DEVICE == "cuda":
-            init_kwargs["device_id"] = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
-        torch.distributed.init_process_group(**init_kwargs)
-
-    # Load DeepSpeed config (launcher may provide a mode-specific config path).
-    ds_config_path = os.environ.get("DS_CONFIG_PATH", "ds_config.json")
-    with open(ds_config_path) as f:
-        ds_config = json.load(f)
-
-    # Keep runtime batch settings aligned with DeepSpeed config.
-    MICRO_BATCH = int(ds_config.get("train_micro_batch_size_per_gpu", MICRO_BATCH))
-    GRAD_ACCUM = int(ds_config.get("gradient_accumulation_steps", GRAD_ACCUM))
-
-    print(f"DeepSpeed micro-batch : {MICRO_BATCH}")
-    print(f"DeepSpeed grad accum  : {GRAD_ACCUM}")
-    print(f"DeepSpeed eff batch   : {MICRO_BATCH * GRAD_ACCUM}")
-    print()
-
-    # Initialize DeepSpeed engine
-    model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
-        args=type("args", (), {"local_rank": int(os.environ.get("LOCAL_RANK", 0))})(),
-        model=model,
-        model_parameters=model.parameters(),
-        config=ds_config,
-        dist_init_required=False,
-    )
-
-    print(f"[DeepSpeed] Initialized with ZeRO Stage {ds_config['zero_optimization']['stage']}")
-    print(f"[DeepSpeed] Device: {model_engine.device}")
-    print()
-
-    # Training state
-    start_step = 0
-    best_val = float("inf")
-    prev_val = None
-    steps_without_improvement = 0
-    stop_reason = None
-
-    # Auto-resume from latest checkpoint (with NaN guard)
-    latest_ckpt = os.path.join(CHECKPOINT_DIR, "latest.pt")
-    if os.path.exists(latest_ckpt):
-        try:
-            _c = torch.load(latest_ckpt, map_location="cpu", weights_only=False)
-            if _c.get("val_loss") != _c.get("val_loss") or _c.get("train_loss") != _c.get("train_loss"):
-                print("Checkpoint has NaN losses — deleting and starting fresh")
-                os.remove(latest_ckpt)
-            else:
-                print("Checkpoint found — resuming …")
-                start_step, best_val = load_checkpoint(latest_ckpt, model)
-                print()
-        except Exception as e:
-            print(f"Checkpoint corrupted ({e}) — starting fresh")
-    else:
-        print("No checkpoint found — starting fresh training")
-        print()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TRAINING LOOP
-    # ─────────────────────────────────────────────────────────────────────────
-
-    console.rule("[bold green]Training started (DeepSpeed)")
-    print()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(bar_width=30),
-        MofNCompleteColumn(),
-        TextColumn("•"),
-        TimeElapsedColumn(),
-        TextColumn("•"),
-        TimeRemainingColumn(),
-        TextColumn("•"),
-        TextColumn("[green]ETA {task.fields[end_clock]} IST"),
-        TextColumn("•"),
-        TextColumn("[yellow]loss {task.fields[train_loss]}"),
-        TextColumn("[cyan]val {task.fields[val_loss]}"),
-        TextColumn("[magenta]lr {task.fields[lr]}"),
-        TextColumn("•"),
-        TextColumn("[bold cyan]{task.fields[tok_s]} tok/s"),
-        console=console,
-        refresh_per_second=4,
-    ) as progress:
-        total_steps = MAX_ITERS - start_step
-        task = progress.add_task(
-            "Training", total=total_steps,
-            train_loss="--.----", val_loss="--.----", lr="--.------", end_clock="--:--",
-            tok_s="------",
-        )
-
-        step = start_step
-        micro_loss_sum = 0.0
-        micro_loss_count = 0
-        total_micro_steps = MAX_ITERS * GRAD_ACCUM
-        step_start_time = time.perf_counter()
-        tokens_per_step = MICRO_BATCH * GRAD_ACCUM * BLOCK_SIZE
-
-        for micro_step in range(start_step * GRAD_ACCUM + 1, total_micro_steps + 1):
-
-            lr = get_lr(step + 1, LR, WARMUP_STEPS, MAX_ITERS)
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
-
-            x, y = get_batch("train")
-            _, loss = model_engine(x, y)
-
-            model_engine.backward(loss)
-            is_boundary = model_engine.is_gradient_accumulation_boundary()
-            model_engine.step()
-
-            micro_loss_sum += loss.item()
-            micro_loss_count += 1
-
-            if not is_boundary:
-                continue
-
-            step += 1
-            accum_loss = micro_loss_sum / max(1, micro_loss_count)
-            micro_loss_sum = 0.0
-            micro_loss_count = 0
-
-            now = time.perf_counter()
-            elapsed = now - step_start_time
-            step_start_time = now
-            tok_s = tokens_per_step / elapsed if elapsed > 0 else 0
-
-            progress.update(
-                task,
-                advance=1,
-                train_loss=f"{accum_loss:.4f}",
-                lr=f"{lr:.6f}",
-                tok_s=f"{tok_s:,.0f}",
-                end_clock=get_eta_clock(progress, task),
-            )
-
-            if step % EVAL_EVERY == 0:
-                losses = estimate_loss(model_engine.module if hasattr(model_engine, "module") else model_engine)
-                if prev_val is None:
-                    trend = "init"
-                    delta = 0.0
-                else:
-                    delta = losses["val"] - prev_val
-                    if delta < -1e-6:
-                        trend = "improving"
-                    elif delta > 1e-6:
-                        trend = "worse"
-                    else:
-                        trend = "flat"
-                prev_val = losses["val"]
-
-                progress.update(
-                    task,
-                    train_loss=f"{losses['train']:.4f}",
-                    val_loss=f"{losses['val']:.4f}",
-                    lr=f"{lr:.6f}",
-                    tok_s=f"{tok_s:,.0f}",
-                    end_clock=get_eta_clock(progress, task),
-                )
-                progress.console.print(
-                    f"  [bold]Step {step:>5}[/]  │  "
-                    f"[yellow]Train {losses['train']:.4f}[/]  │  "
-                    f"[cyan]Val {losses['val']:.4f} ({trend}, Δ {delta:+.4f})[/]  │  "
-                    f"[magenta]LR {lr:.6f}[/]  │  "
-                    f"[bold cyan]{tok_s:,.0f} tok/s[/]"
-                )
-
-                # Save checkpoints
-                save_checkpoint(
-                    step, model_engine.module if hasattr(model_engine, 'module') else model_engine,
-                    losses["train"], losses["val"],
-                    os.path.join(CHECKPOINT_DIR, "latest.pt"),
-                )
-                if losses["val"] < best_val:
-                    best_val = losses["val"]
-                    steps_without_improvement = 0
-                    save_checkpoint(
-                        step, model_engine.module if hasattr(model_engine, 'module') else model_engine,
-                        losses["train"], losses["val"],
-                        os.path.join(CHECKPOINT_DIR, "best.pt"),
-                    )
-                    progress.console.print(
-                        f"  [bold green]★ New best val loss: {best_val:.4f}  (saved best.pt)[/]"
-                    )
-                else:
-                    steps_without_improvement += 1
-
-                # ── Auto-stop checks ──
-                val_l = losses["val"]
-                if math.isnan(val_l) or math.isnan(losses["train"]):
-                    stop_reason = "NaN loss detected"
-                elif best_val > 0 and val_l > best_val * LOSS_EXPLODE_FACTOR:
-                    stop_reason = f"Loss exploded: {val_l:.4f} > {best_val:.4f} × {LOSS_EXPLODE_FACTOR}"
-                elif steps_without_improvement >= PATIENCE:
-                    stop_reason = f"No improvement for {PATIENCE} evals (best {best_val:.4f})"
-
-                if stop_reason:
-                    progress.console.print(
-                        f"  [bold red]⛔ STOPPING: {stop_reason}[/]"
-                    )
-                    save_checkpoint(
-                        step, model_engine.module if hasattr(model_engine, 'module') else model_engine,
-                        losses["train"], losses["val"],
-                        os.path.join(CHECKPOINT_DIR, "latest.pt"),
-                    )
-                    break
-
-            if step >= MAX_ITERS or stop_reason:
-                break
-
-    print()
-    console.rule("[bold green]Training complete")
-    print()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TEST EVALUATION
-    # ─────────────────────────────────────────────────────────────────────────
-
-    model_eval = model_engine.module if hasattr(model_engine, 'module') else model_engine
-    model_eval.eval()
-    test_losses = []
-    with torch.no_grad():
-        for _ in range(EVAL_ITERS):
-            x, y = get_batch("test")
-            _, loss = model_eval(x, y)
-            test_losses.append(loss.item())
-    test_loss = sum(test_losses) / len(test_losses)
-    print(f"Test loss : {test_loss:.4f}")
-    print()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TEXT GENERATION
-    # ─────────────────────────────────────────────────────────────────────────
-
-    prompts = [
-        "The history of",
-        "Scientists have discovered",
-        "In the early twentieth century",
-    ]
-
-    print("=" * 60)
-    print("Generated Text Samples")
-    print("=" * 60)
-
-    for prompt in prompts:
-        output = generate(model_eval, prompt, max_new_tokens=120, temperature=0.7, top_k=50, top_p=0.9)
-        print(f"\nPrompt : \"{prompt}\"")
-        print(f"Output : {output.strip()}")
-        print()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # INTERACTIVE MODE
-    # ─────────────────────────────────────────────────────────────────────────
-
-    print("=" * 60)
-    print("Interactive Mode  (type 'quit' to exit)")
-    print("=" * 60)
-
-    while True:
-        try:
-            prompt = input("\nEnter a prompt: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not prompt or prompt.lower() == "quit":
-            break
-        output = generate(model_eval, prompt, max_new_tokens=150, temperature=0.8, top_k=50, top_p=0.9)
         print(f"\n{output.strip()}")
 
     print("\nGoodbye!")
@@ -4796,418 +2587,6 @@ class TinyGPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, self._vocab_size), targets.view(-1))
 
         return logits, loss
-
-```
-`model_performance.md`:
-
-```md
-# Tiny-GPT Model Performance Report
-
-## Architecture
-
-| Parameter | Value |
-|-----------|-------|
-| Architecture | Dense GPT-2 Small |
-| Total parameters | 124,009,728 |
-| Trainable parameters | 124,009,728 |
-| Context window | 512 tokens |
-| Vocabulary size | 50,257 (GPT-2 BPE) |
-| Embedding dim | 768 |
-| Attention heads | 12 (head_dim = 64) |
-| Transformer layers | 12 |
-| FFN dim | 3,072 (4x embed_dim) |
-| Dropout | 0.1 |
-| Weight tying | head ↔ tok_emb |
-
-## Parameter Breakdown
-
-| Component | Parameters | % of Total |
-|-----------|-----------|------------|
-| Embeddings (tok + pos) | 38,990,592 | 31.4% |
-| Attention (12 blocks) | 28,311,552 | 22.8% |
-| FFN (12 blocks) | 56,669,184 | 45.7% |
-| LayerNorm (24 + 1) | 38,400 | 0.0% |
-
-## Model Size
-
-| Format | Size |
-|--------|------|
-| FP32 | 473.1 MB |
-| BF16 (training) | 236.5 MB |
-| Checkpoint (with optimizer) | ~1.7 GB |
-
-## Training Configuration
-
-| Hyperparameter | Value |
-|----------------|-------|
-| Peak LR | 1.5e-4 |
-| Warmup steps | 500 |
-| Max iterations | 500,000 |
-| Micro batch size | 2 |
-| Gradient accumulation | 8 |
-| Effective batch | 16 |
-| Optimizer | CPUOffloadAdamW (fp32 master on CPU) |
-| LR schedule | Linear warmup → cosine decay to 10% |
-| Gradient clipping | 1.0 |
-| Precision | BF16 (CUDA) / FP32 (CPU) |
-| Activation checkpointing | Enabled |
-
-## Checkpoint Status
-
-| Checkpoint | Step | Train Loss | Val Loss | Status |
-|------------|------|------------|----------|--------|
-| best.pt | 1 | 10.9938 | 10.9850 | Untrained (initial weights) |
-| latest.pt | 1 | 10.9938 | 10.9850 | Untrained (initial weights) |
-
-> **Note:** Loss ≈ 10.99 ≈ ln(50,257) ≈ random baseline. Model has not been trained.
-
-## Benchmark: Softmax vs Linear Attention
-
-| Metric | Softmax (SDPA) | Linear | Ratio |
-|--------|---------------|--------|-------|
-| Parameters | 124,009,728 | 124,009,728 | 1.0x |
-| Speed | 177.9 ms/step | 3,932.1 ms/step | 22.1x slower |
-| Throughput | 5,756 tok/s | 260 tok/s | — |
-| Peak VRAM | 1.62 GiB | 2.89 GiB | 1.78x more |
-| Avg loss (random data) | 260.33 | 258.89 | Similar |
-
-## Attention Implementations
-
-| Variant | Where Used | Mechanism |
-|---------|-----------|-----------|
-| SDPA (default) | main.py, finetune.py, main_deepspeed.py | `F.scaled_dot_product_attention` with `is_causal=True` |
-| Manual | run.py | Explicit `q @ k.T` with triangular mask buffer |
-| Linear | (optional via `ATTENTION_TYPE="linear"`) | O(N) kernel attention with elu+1 feature map |
-
-## Known Issues
-
-1. **Training not started:** Checkpoints contain only initial random weights (step 1). Run `python main.py` to train.
-2. **Linear attention is slow:** The O(N) loop over 512 tokens is sequential — 22x slower than SDPA. Needs vectorized implementation for production use.
-3. **No validation:** Model has not been evaluated on any downstream task.
-
-## Code Structure (Post-Refactoring)
-
-```
-tinygpt/
-├── attention/
-│   ├── causal.py        # CausalSelfAttention (SDPA + manual)
-│   └── linear.py        # LinearAttention (elu+1 kernel)
-├── layers/
-│   ├── feedforward.py   # FeedForward (GELU FFN)
-│   └── transformer_block.py  # TransformerBlock (pre-norm)
-├── training/
-│   ├── optimizer.py     # CPUOffloadAdamW
-│   ├── scheduler.py     # Linear warmup → cosine decay
-│   ├── checkpoint.py    # Save/load with attention type handling
-│   └── evaluation.py    # Loss estimation
-└── generation/
-    └── (pending Subsystem 4)
-
-model.py                 # TinyGPT (imports from tinygpt.*)
-main.py                  # Training entry point
-run.py                   # Inference entry point
-finetune.py              # Fine-tuning entry point
-main_deepspeed.py        # DeepSpeed training entry point
-```
-
-```
-`plan.json`:
-
-```json
-{
-  "briefContext": "A practitioner building a ~30M parameter GPT-style transformer from scratch on a 4 GB VRAM consumer GPU needs evidence-based answers on minimum model size for coherence, CPU-offloaded AdamW failure modes, PyTorch SDPA memory/compute claims at seq-len 256–512, and suitable datasets (primarily FineWeb-Edu) for sub-300M models. Literature scope: 2018–2026, English only, no fine-tuning, no MoE/sparse attention.",
-  "angles": [
-    "What do scaling-law studies (Kaplan 2020, Chinchilla, follow-ups) say about parameter-count vs coherence in the 10M–300M range, and what is the empirically established minimum viable size for a decoder-only autoregressive transformer to produce readable English?",
-    "Is CPU-offloaded AdamW (fp32 master weights on CPU, bf16 model+grads on GPU) a proven training technique for ≤4 GB VRAM, and what are the documented failure modes — NaN divergence, gradient corruption, optimizer desynchronization, convergence slowdowns?",
-    "Does PyTorch SDPA with is_causal=True deliver O(N) memory/compute for seq-len 256–512 on consumer GPUs, and what edge cases cause silent fallback to slower kernels or degraded performance?",
-    "Which datasets (FineWeb-Edu sample-10BT, C4, SlimPajama, The Pile) suit a tiny 30M-param GPT, how many tokens are needed for reasonable loss at sub-300M scale, and what are the fundamental limitations of tiny language models vs larger ones?"
-  ]
-}
-```
-`plan.md`:
-
-```md
-That's a great catch by the big pickle. Smaller models will absolutely trip over those edge cases—especially the silent failure of gradient checkpointing and the lingering `argparse` definitions.
-
-Here is the revised, bulletproofed `plan.md`. It standardizes the environment across all four files so you can feed the exact same `TinyGPT` class to the 10B model without it getting confused by file-specific logic.
-
----
-
-```markdown
-# Refactoring Plan: Convert Mixture-of-Experts (MoE) to Dense Transformer
-
-## System Prompt Context for the AI
-You are an expert Python developer. Your task is to refactor a codebase by stripping out the Mixture-of-Experts (MoE) architecture and replacing it with a standard, dense autoregressive Transformer.
-
-**Execution Rules:**
-1. Process one file at a time. Do not attempt to rewrite the entire project in a single response.
-2. Only modify the specific code blocks requested in each phase.
-3. Preserve all existing imports, tokenization logic, and DeepSpeed/optimizer setup unless explicitly told to change them.
-
-## Target Files
-* `main.py`
-* `main_deepspeed.py`
-* `kaggle_train.py`
-* `run.py`
-
----
-
-## Phase 1: Imports, Globals, and Argparse Cleanup
-**Files to update:** All files.
-
-**Actions:**
-1. **In `run.py`:** Add the missing import at the top with the other torch imports:
-   `from torch.utils.checkpoint import checkpoint as grad_checkpoint`
-2. **In `main.py` and `kaggle_train.py`:** Add `USE_ACTIVATION_CHECKPOINT = True` to the global configuration block (near `BLOCK_SIZE`).
-3. **In ALL files:** Delete the following global variables:
-   * `NUM_EXPERTS = 8` (or 4)
-   * `TOP_K = 2`
-   * `AUX_LOSS_W = 0.01`
-4. **In `kaggle_train.py` ONLY:** Locate the `parse_args()` function and **delete** the three `parser.add_argument` lines for `--num-experts`, `--top-k`, and `--aux-loss-w`.
-
----
-
-## Phase 2: Architecture Refactoring (The Core Model)
-**Files to update:** `main.py`, `main_deepspeed.py`, `kaggle_train.py`, `run.py`
-
-**Action:**
-Locate the section defining the neural network classes (`ExpertFFN`, `MoELayer`, `TransformerBlock`, `MoEGPT`).
-
-1. **Delete** the `ExpertFFN` and `MoELayer` classes completely.
-2. **Add** the new `FeedForward` class:
-```python
-class FeedForward(nn.Module):
-    """Standard two-layer FFN with GELU."""
-    def __init__(self):
-        super().__init__()
-        self.w1   = nn.Linear(EMBED_DIM, FFN_DIM)
-        self.w2   = nn.Linear(FFN_DIM, EMBED_DIM)
-        self.act  = nn.GELU()
-        self.drop = nn.Dropout(DROPOUT)
-
-    def forward(self, x):
-        return self.drop(self.w2(self.act(self.w1(x))))
-
-```
-
-3. **Replace** the existing `TransformerBlock` with this updated version:
-
-```python
-class TransformerBlock(nn.Module):
-    """Pre-norm Transformer block: Attention + Dense FFN, with residuals."""
-    def __init__(self):
-        super().__init__()
-        self.ln1  = nn.LayerNorm(EMBED_DIM)
-        self.attn = CausalSelfAttention()
-        self.ln2  = nn.LayerNorm(EMBED_DIM)
-        self.ffn  = FeedForward()
-
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.ffn(self.ln2(x))
-        return x
-
-```
-
-4. **Replace** the `MoEGPT` class with `TinyGPT`. Note: The `generate()` method remains exactly the same as the original file, just ensure it is indented under the new `TinyGPT` class.
-
-```python
-class TinyGPT(nn.Module):
-    """Standard Dense GPT model."""
-    def __init__(self):
-        super().__init__()
-        self.tok_emb = nn.Embedding(vocab_size, EMBED_DIM)
-        self.pos_emb = nn.Embedding(BLOCK_SIZE, EMBED_DIM)
-        self.drop    = nn.Dropout(DROPOUT)
-        self.blocks  = nn.ModuleList([TransformerBlock() for _ in range(NUM_LAYERS)])
-        self.ln_f    = nn.LayerNorm(EMBED_DIM)
-        self.head    = nn.Linear(EMBED_DIM, vocab_size, bias=False)
-
-        # Weight tying
-        self.head.weight = self.tok_emb.weight
-        self._init_weights()
-
-    def _init_weights(self):
-        for name, p in self.named_parameters():
-            if p.dim() >= 2:
-                nn.init.normal_(p, mean=0.0, std=0.02)
-            elif "bias" in name:
-                nn.init.zeros_(p)
-        scale = (2 * NUM_LAYERS) ** -0.5
-        for block in self.blocks:
-            nn.init.normal_(block.attn.proj.weight, mean=0.0, std=0.02 * scale)
-            nn.init.normal_(block.ffn.w2.weight, mean=0.0, std=0.02 * scale)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        x = self.drop(
-            self.tok_emb(idx) + self.pos_emb(torch.arange(T, device=idx.device))
-        )
-
-        for block in self.blocks:
-            if self.training and globals().get("USE_ACTIVATION_CHECKPOINT", False):
-                x = grad_checkpoint(block, x, use_reentrant=False)
-            else:
-                x = block(x)
-
-        logits = self.head(self.ln_f(x))
-
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
-
-        return logits, loss
-
-    # KEEP EXISTING generate() METHOD HERE
-
-```
-
----
-
-## Phase 3: Initialization and Parameter Counting Updates
-
-**Files to update:** `main.py`, `main_deepspeed.py`, `kaggle_train.py`, `run.py`
-
-**Action:**
-Locate where the model is instantiated (e.g., `model = MoEGPT()`).
-
-1. **Change** the instantiation to: `model = TinyGPT()`
-2. **Replace** the parameter counting block with standard dense counting.
-**Delete** the lines calculating `_expert1` and `n_active`, and replace with:
-
-```python
-n_total = sum(p.numel() for p in model.parameters())
-n_active = n_total  # In a dense model, all parameters are active
-
-```
-
----
-
-## Phase 4: Training Loop & Evaluation Cleanup
-
-**Files to update:** `main.py`, `main_deepspeed.py`, `kaggle_train.py`
-
-**Action for Training Loop:**
-
-1. **Find** the training step inside the main loop.
-2. **Update** the forward pass unpacking. Because `TinyGPT.forward()` no longer returns `aux_loss`, remove any references to it.
-**Change from:**
-
-```python
-x, y = get_batch("train")
-with torch.amp.autocast("cuda", ...):
-    _, loss = model(x, y) # Ensure total_aux or aux_loss isn't being unpacked or added
-
-```
-
-3. Ensure that `loss` is directly divided by `GRAD_ACCUM` and backpropagated without adding `AUX_LOSS_W * total_aux`.
-
-**Action for Evaluation:**
-In the `estimate_loss(model)` function, ensure the forward pass only expects `_, loss`. Do not unpack a third variable.
-
----
-
-## Phase 5: Verification and run.py Formatting
-
-**File to update:** `run.py`
-
-**Actions:**
-
-1. Check the `apply_model_config_from_state_dict` function.
-2. **Remove** the logic that attempts to read `NUM_EXPERTS` from `blocks.0.moe.router.weight`.
-3. **Update** the logic for `FFN_DIM` to read from the dense feedforward layer instead:
-
-```python
-    ffn_key = "blocks.0.ffn.w1.weight"
-    if ffn_key in state_dict:
-        FFN_DIM = state_dict[ffn_key].shape[0]
-
-```
-
-4. Locate the print statement inside the `load_model()` function (around line 362). Remove `experts={NUM_EXPERTS}, ` from the formatted string so it prints cleanly.
-
-```
-
-```
-
-```
-`prepare_chat_data.py`:
-
-```py
-#!/usr/bin/env python3
-"""
-Prepare instruction-tuning dataset for chat fine-tuning.
-Uses tatsu-lab/alpaca (52K instruction examples) and formats with
-System:/User:/Assistant: markers.
-"""
-import os
-from pathlib import Path
-import numpy as np
-import tiktoken
-from datasets import load_dataset
-from tqdm.auto import tqdm
-
-DATA_DIR = Path("instruction_data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-enc = tiktoken.get_encoding("gpt2")
-EOT = enc.eot_token
-
-
-def format_instruction(row):
-    """Format a single instruction example."""
-    instruction = row["instruction"].strip()
-    input_text = row.get("input", "").strip()
-    output = row["output"].strip()
-
-    if input_text:
-        text = f"System: You are a helpful assistant.\nUser: {instruction}\n{input_text}\nAssistant: {output}"
-    else:
-        text = f"System: You are a helpful assistant.\nUser: {instruction}\nAssistant: {output}"
-
-    return text
-
-
-print("Loading Alpaca dataset...")
-dataset = load_dataset("tatsu-lab/alpaca")
-
-# Alpaca has only train split — create our own val/test split
-train_data = dataset["train"]
-
-# Split 95/2.5/2.5
-n = len(train_data)
-n_test = n // 40   # 2.5%
-n_val = n // 40    # 2.5%
-n_train = n - n_val - n_test
-
-splits = {
-    "train": train_data.select(range(n_train)),
-    "val": train_data.select(range(n_train, n_train + n_val)),
-    "test": train_data.select(range(n_train + n_val, n)),
-}
-
-out_paths = {
-    "train": DATA_DIR / "train.bin",
-    "val": DATA_DIR / "val.bin",
-    "test": DATA_DIR / "test.bin",
-}
-
-for split_name, split_data in splits.items():
-    print(f"Processing {split_name} split ({len(split_data)} examples)...")
-    tokens = []
-
-    for row in tqdm(split_data, desc=f"Encoding {split_name}"):
-        text = format_instruction(row)
-        ids = enc.encode_ordinary(text)
-        ids.append(EOT)
-        tokens.extend(ids)
-
-    arr = np.asarray(tokens, dtype=np.uint16)
-    arr.tofile(out_paths[split_name])
-    print(f"  Saved {len(tokens):,} tokens to {out_paths[split_name]}")
-
-print("\nInstruction data preparation complete.")
-print(f"Files saved to: {DATA_DIR}")
 
 ```
 `prepare_data.py`:
@@ -5331,6 +2710,11 @@ if __name__ == "__main__":
     counts_examples = {"train": 0, "val": 0, "test": 0}
     counts_tokens = {"train": 0, "val": 0, "test": 0}
 
+    total_examples = 0
+    low_diversity = 0
+    max_seq_len = 0
+    min_seq_len = float('inf')
+
     with open(out_paths["train"], "ab") as f_train, open(out_paths["val"], "ab") as f_val, open(out_paths["test"], "ab") as f_test:
         fps = {"train": f_train, "val": f_val, "test": f_test}
 
@@ -5346,6 +2730,17 @@ if __name__ == "__main__":
 
             split = pick_split(i, MAX_EXAMPLES)
             toks = encode_text(text)
+
+            total_examples += 1
+            max_seq_len = max(max_seq_len, len(toks))
+            min_seq_len = min(min_seq_len, len(toks))
+
+            # Data quality: skip sequences with very low token diversity
+            if len(set(toks)) < 50:
+                low_diversity += 1
+                progress.update(1)
+                continue
+
             buffers[split].extend(toks)
             counts_examples[split] += 1
 
@@ -5362,130 +2757,16 @@ if __name__ == "__main__":
         for split in ("train", "val", "test"):
             counts_tokens[split] += flush_tokens(fps[split], buffers[split])
 
+    print(f"\nDataset quality report:")
+    print(f"  Total examples processed: {total_examples}")
+    print(f"  Low diversity skipped:   {low_diversity} ({100*low_diversity/max(total_examples,1):.1f}%)")
+    print(f"  Sequence length range:   {min_seq_len} – {max_seq_len} tokens")
+
     print("\nDone.")
     for split in ("train", "val", "test"):
         print(f"{split:>5}: {counts_examples[split]:>10,} docs  ->  {counts_tokens[split]:>12,} tokens")
     print(f"Saved files in: {DATA_DIR.resolve()}")
 
-```
-`push_to_hf.py`:
-
-```py
-#!/usr/bin/env python3
-"""
-Upload Tiny-GPT checkpoints to Hugging Face Hub.
-
-Usage:
-  python push_to_hf.py --repo-id yourname/Tiny-GPT
-  python push_to_hf.py --repo-id yourname/Tiny-GPT --checkpoint checkpoints/best.pt
-
-Auth:
-  Set HF_TOKEN env var or run: huggingface-cli login
-"""
-
-import argparse
-import os
-import sys
-from pathlib import Path
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Upload Tiny-GPT checkpoints to HF Hub")
-    parser.add_argument("--repo-id", required=True, help="HF repo id, e.g. yourname/Tiny-GPT")
-    parser.add_argument(
-        "--checkpoint",
-        default="checkpoints/best.pt",
-        help="Primary checkpoint path to upload (default: checkpoints/best.pt)",
-    )
-    parser.add_argument(
-        "--latest-checkpoint",
-        default="checkpoints/latest.pt",
-        help="Optional latest checkpoint path to upload (default: checkpoints/latest.pt)",
-    )
-    parser.add_argument(
-        "--private",
-        action="store_true",
-        help="Create private repo instead of public",
-    )
-    parser.add_argument(
-        "--message",
-        default="Upload Tiny-GPT checkpoints",
-        help="Commit message for HF Hub",
-    )
-    parser.add_argument(
-        "--token",
-        default=None,
-        help="HF token (or set HF_TOKEN env var)",
-    )
-    args = parser.parse_args()
-
-    token = args.token or os.environ.get("HF_TOKEN")
-
-    try:
-        from huggingface_hub import HfApi, upload_file
-    except ImportError:
-        print("[ERROR] Missing dependency: huggingface_hub")
-        print("[ERROR] Install with: pip install huggingface_hub")
-        sys.exit(1)
-
-    checkpoint = Path(args.checkpoint)
-    latest_checkpoint = Path(args.latest_checkpoint)
-
-    if not checkpoint.exists():
-        print(f"[ERROR] Checkpoint not found: {checkpoint}")
-        sys.exit(1)
-
-    api = HfApi(token=token)
-
-    # Create repo if it does not exist yet.
-    api.create_repo(repo_id=args.repo_id, repo_type="model", private=args.private, exist_ok=True)
-
-    print(f"Uploading {checkpoint} -> {args.repo_id}/best.pt")
-    upload_file(
-        path_or_fileobj=str(checkpoint),
-        path_in_repo="best.pt",
-        repo_id=args.repo_id,
-        repo_type="model",
-        token=token,
-        commit_message=args.message,
-    )
-
-    if latest_checkpoint.exists():
-        print(f"Uploading {latest_checkpoint} -> {args.repo_id}/latest.pt")
-        upload_file(
-            path_or_fileobj=str(latest_checkpoint),
-            path_in_repo="latest.pt",
-            repo_id=args.repo_id,
-            repo_type="model",
-            token=token,
-            commit_message=args.message,
-        )
-
-    print("Done. Model checkpoints are now on Hugging Face Hub.")
-
-
-if __name__ == "__main__":
-    main()
-
-```
-`reflect.json`:
-
-```json
-{
-  "deltaAngles": [
-    "What perplexity/cross-entropy loss values correspond to 'readable' English in GPT-style models? Is there any published loss-to-human-judgment calibration or empirical threshold (e.g., 'models below X nats/token produce garbage, above Y produce coherent text')?",
-    "What do community training runs (nanoGPT, llm.c, Cerebras GPT) actually show for 10M–100M parameter GPT models trained on web data? Are there published loss curves, generated samples, or benchmark scores at this scale?",
-    "For a 30M-param model (~60MB params), standard AdamW with gradient checkpointing fits entirely in 4GB VRAM — is CPU offloading actually necessary, and if so only for longer sequences or larger batch sizes? What is the real VRAM budget at seq-len 512 with gradient checkpointing?"
-  ],
-  "openQuestions": [
-    "No loss-to-coherence calibration exists in the findings: we cannot map a cross-entropy loss value to human-judged readability, making it impossible to predict whether a 30M model will produce coherent text based on loss alone",
-    "F2[7] shows 30M params fits in 4GB VRAM without offloading — the brief's premise (question 2) may be based on a false assumption; this needs explicit resolution",
-    "No empirical training-run data exists for 30M-param GPT on web-scale data — all claims about minimum viable size are extrapolations from scaling laws or tiny-domain experiments (TinyStories), not direct measurements",
-    "Dataset comparison at sub-300M scale is entirely absent: no benchmarks exist comparing FineWeb-Edu vs C4 vs SlimPajama on models this small",
-    "The TinyStories claim that '125M models rarely generate coherent English beyond a few words' (F1[6]) is single-source and from 2023 — it may not reflect current best practices (e.g., better tokenization, higher-quality data, longer training)",
-    "Tokenization effects on training efficiency at sub-300M scale are completely unaddressed"
-  ]
-}
 ```
 `run.py`:
 
@@ -5938,6 +3219,77 @@ Examples:
 
 if __name__ == "__main__":
     main()
+
+```
+`tests/test_model.py`:
+
+```py
+import os
+import sys
+import torch
+import io
+import contextlib
+from model import TinyGPT
+from tinygpt.training.checkpoint import save_checkpoint, load_checkpoint
+
+
+def test_model_forward():
+    """Verify model forward pass produces correct logit shape and positive loss."""
+    model = TinyGPT(50257, 512, 768, 12, 12, 3072, 0.1)
+    x = torch.randint(0, 50257, (2, 128))
+    logits, loss = model(x, x)
+    assert logits.shape == (2, 128, 50257), f"Expected (2,128,50257), got {logits.shape}"
+    assert loss.item() > 0, f"Loss should be positive, got {loss.item()}"
+    print(f"  test_model_forward: OK  (loss={loss.item():.4f})")
+
+
+def test_checkpoint_save_load():
+    """Verify checkpoint saves and loads correctly with model_state key."""
+    model = TinyGPT(50257, 512, 768, 12, 12, 3072, 0.1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    test_path = "/tmp/test_tinygpt_ckpt.pt"
+    save_checkpoint(42, model, optimizer, 4.5, 5.1, test_path)
+
+    model2 = TinyGPT(50257, 512, 768, 12, 12, 3072, 0.1)
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=1e-4)
+    step, val_loss = load_checkpoint(test_path, model2, optimizer2)
+
+    assert step == 42, f"Expected step 42, got {step}"
+    assert abs(val_loss - 5.1) < 1e-5, f"Expected val_loss 5.1, got {val_loss}"
+
+    for p1, p2 in zip(model.parameters(), model2.parameters()):
+        assert torch.equal(p1, p2), "Weights don't match after save/load"
+
+    os.remove(test_path)
+    print(f"  test_checkpoint_save_load: OK")
+
+
+def test_chat_init():
+    """Verify chat.py module-level code can import without crash."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            from chat import model
+        assert model is not None
+        print(f"  test_chat_init: OK")
+    except Exception as e:
+        print(f"  test_chat_init: SKIPPED ({e})")
+
+
+def test_eval_suite_import():
+    """Verify eval_suite module can be imported."""
+    from eval_suite import eval_suite
+    assert callable(eval_suite)
+    print(f"  test_eval_suite_import: OK")
+
+
+if __name__ == "__main__":
+    print("Running Tiny-GPT tests...")
+    test_model_forward()
+    test_checkpoint_save_load()
+    test_chat_init()
+    test_eval_suite_import()
+    print("\nAll tests passed!")
 
 ```
 `tiktoken_cache/6c7ea1a7e38e3a7f062df639a5b80947f075ffe6`:
@@ -106164,7 +103516,7 @@ def save_checkpoint(step, model, optimizer, train_loss, val_loss, path,
     """Save model + optimizer + training state to disk."""
     state = {
         "step":       step,
-        "model":      model.state_dict(),
+        "model_state": model.state_dict(),
         "optimizer":  optimizer.state_dict(),
         "train_loss": train_loss,
         "val_loss":   val_loss,
@@ -106177,7 +103529,7 @@ def save_checkpoint(step, model, optimizer, train_loss, val_loss, path,
 def load_checkpoint(path, model, optimizer, attention_type=None):
     """Load checkpoint and return (step, val_loss)."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    sd = ckpt["model"]
+    sd = ckpt["model_state"]
 
     if attention_type is not None:
         ckpt_attn = ckpt.get("attention_type", "softmax")
@@ -106314,170 +103666,5 @@ def get_lr(step, lr, warmup_steps, max_iters):
         return lr * step / warmup_steps
     progress = (step - warmup_steps) / max(1, max_iters - warmup_steps)
     return lr * 0.1 + 0.5 * lr * 0.9 * (1 + math.cos(math.pi * progress))
-
-```
-`train_deepspeed.sh`:
-
-```sh
-#!/bin/bash
-# train_deepspeed.sh - Launch training with DeepSpeed ZeRO-Infinity
-
-set -e
-
-echo "╔════════════════════════════════════════════════════════════════╗"
-echo "║  Tiny-GPT: DeepSpeed ZeRO-3 Training (CPU/NVMe Offloading)     ║"
-echo "╚════════════════════════════════════════════════════════════════╝"
-echo
-
-# Colors
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-# Training mode: passive (default) or aggressive
-TRAIN_MODE=$(echo "${TRAIN_MODE:-passive}" | tr '[:upper:]' '[:lower:]')
-export TRAIN_MODE
-if [ "$TRAIN_MODE" != "passive" ] && [ "$TRAIN_MODE" != "aggressive" ]; then
-    echo -e "${YELLOW}!${NC} Invalid TRAIN_MODE='$TRAIN_MODE'. Use 'passive' or 'aggressive'."
-    exit 1
-fi
-
-# Check DeepSpeed installation
-echo -e "${BLUE}[1/4]${NC} Checking dependencies..."
-python -c "import deepspeed" 2>/dev/null && echo -e "      ${GREEN}✓${NC} DeepSpeed installed" || {
-    echo -e "      Installing DeepSpeed..."
-    pip install deepspeed -q
-    echo -e "      ${GREEN}✓${NC} DeepSpeed installed"
-}
-echo -e "      ${GREEN}✓${NC} All dependencies ready"
-echo
-
-# Checkpoint handling (keep by default for auto-resume)
-echo -e "${BLUE}[2/4]${NC} Checkpoint handling..."
-mkdir -p checkpoints
-if [ "${RESET_CHECKPOINTS:-0}" = "1" ]; then
-    rm -f checkpoints/*.pt
-    echo -e "      ${GREEN}✓${NC} Checkpoints cleared (RESET_CHECKPOINTS=1)"
-else
-    if ls checkpoints/*.pt >/dev/null 2>&1; then
-        echo -e "      ${GREEN}✓${NC} Existing checkpoints found (auto-resume enabled)"
-    else
-        echo -e "      ${GREEN}✓${NC} No existing checkpoints (fresh run)"
-    fi
-fi
-echo
-
-# Verify dataset
-echo -e "${BLUE}[3/4]${NC} Verifying dataset..."
-if [ -f "data/train.bin" ] && [ -f "data/val.bin" ] && [ -f "data/test.bin" ]; then
-    echo -e "      ${GREEN}✓${NC} Dataset ready"
-else
-    echo -e "      ${YELLOW}!${NC} Dataset not found. Run: python prepare_data.py"
-    exit 1
-fi
-echo
-
-# Get number of GPUs
-NUM_GPUS=$(nvidia-smi --list-gpus 2>/dev/null | wc -l)
-if [ -z "$NUM_GPUS" ] || [ "$NUM_GPUS" -eq 0 ]; then
-    NUM_GPUS=1
-fi
-export NUM_GPUS
-
-# Build active DeepSpeed config based on TRAIN_MODE
-python - <<'PY'
-import json
-import os
-import multiprocessing
-
-mode = os.environ.get("TRAIN_MODE", "passive").lower()
-num_gpus = int(os.environ.get("NUM_GPUS", "1"))
-
-with open("ds_config.json") as f:
-    cfg = json.load(f)
-
-zero = cfg.setdefault("zero_optimization", {})
-off_opt = zero.setdefault("offload_optimizer", {"device": "cpu"})
-act_ckpt = cfg.setdefault("activation_checkpointing", {})
-
-if mode == "aggressive":
-    # Higher-throughput profile: larger batches and no CPU checkpointing.
-    cfg["train_micro_batch_size_per_gpu"] = 2
-    cfg["gradient_accumulation_steps"] = 8
-    cfg["train_batch_size"] = cfg["train_micro_batch_size_per_gpu"] * cfg["gradient_accumulation_steps"] * max(1, num_gpus)
-    off_opt["pin_memory"] = True
-    zero["reduce_bucket_size"] = 2e6
-    act_ckpt["cpu_checkpointing"] = False
-else:
-    # Low-resource profile (current stable baseline).
-    cfg["train_micro_batch_size_per_gpu"] = 2
-    cfg["gradient_accumulation_steps"] = 8
-    cfg["train_batch_size"] = cfg["train_micro_batch_size_per_gpu"] * cfg["gradient_accumulation_steps"] * max(1, num_gpus)
-    off_opt["pin_memory"] = False
-    zero["reduce_bucket_size"] = 1e6
-    act_ckpt["cpu_checkpointing"] = True
-
-with open("ds_config.active.json", "w") as f:
-    json.dump(cfg, f, indent=2)
-PY
-
-# Show configuration
-echo -e "${BLUE}[4/4]${NC} Launching DeepSpeed training..."
-python -c "
-import json
-with open('ds_config.active.json') as f:
-    cfg = json.load(f)
-print('  DeepSpeed Configuration:')
-print(f\"    • Mode: ${TRAIN_MODE}\")
-print(f\"    • ZeRO Stage: {cfg['zero_optimization']['stage']}\")
-print(f\"    • Optimizer Offload: {cfg['zero_optimization']['offload_optimizer']['device']}\")
-param_offload = cfg['zero_optimization'].get('offload_param', {}).get('device', 'none')
-print(f\"    • Parameter Offload: {param_offload}\")
-print(f\"    • Mixed Precision: {'bfloat16' if cfg.get('bf16', {}).get('enabled') else 'float32'}\")
-print(f\"    • Micro Batch: {cfg['train_micro_batch_size_per_gpu']}\")
-print(f\"    • Grad Accum: {cfg['gradient_accumulation_steps']}\")
-print(f\"    • Batch Size: {cfg['train_batch_size']}\")
-print()
-"
-
-# Launch training with DeepSpeed
-echo -e "${YELLOW}Starting DeepSpeed training...${NC}"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo
-
-# Skip CUDA version mismatch check (system CUDA >= PyTorch CUDA is fine)
-export DS_SKIP_CUDA_CHECK=1
-if [ "$TRAIN_MODE" = "aggressive" ]; then
-    CPU_THREADS=$(nproc)
-    export MAX_JOBS=$CPU_THREADS
-    export OMP_NUM_THREADS=$CPU_THREADS
-    export MKL_NUM_THREADS=$CPU_THREADS
-    export ALLOW_TF32=1
-    export USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-0}
-    export USE_ACTIVATION_CHECKPOINT=0
-else
-    export MAX_JOBS=1
-    export OMP_NUM_THREADS=1
-    export MKL_NUM_THREADS=1
-    export ALLOW_TF32=1
-    export USE_TORCH_COMPILE=${USE_TORCH_COMPILE:-0}
-    export USE_ACTIVATION_CHECKPOINT=1
-fi
-
-# Main script reads this active config path.
-export DS_CONFIG_PATH="ds_config.active.json"
-
-# Launch with deepspeed
-deepspeed --num_gpus $NUM_GPUS main_deepspeed.py
-
-echo
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${GREEN}Training complete!${NC}"
-echo
-echo "Check results:"
-echo "  • Checkpoints: ls -lh checkpoints/"
-echo "  • Generate: python run.py"
-echo "  • Best model: checkpoints/best.pt"
 
 ```

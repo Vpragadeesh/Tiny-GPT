@@ -98,7 +98,7 @@ DROPOUT       = 0.1
 LR            = 1.5e-4           # peak learning rate
 WARMUP_STEPS  = 500              # linear warmup for stability
 MAX_ITERS     = 50_000          # marathon training
-EVAL_EVERY    = 1_000
+EVAL_EVERY    = 500
 EVAL_ITERS    = 50
 USE_ACTIVATION_CHECKPOINT = True  # required for 124M on 4GB VRAM
 GRAD_CLIP     = 1.0
@@ -265,6 +265,7 @@ if __name__ == "__main__":
         TimeElapsedColumn(),
         TextColumn("•"),
         TimeRemainingColumn(),
+        TextColumn("[cyan]ends {task.fields[ends_at]}"),
         TextColumn("•"),
         TextColumn("[yellow]loss {task.fields[train_loss]}"),
         TextColumn("[cyan]val {task.fields[val_loss]}"),
@@ -278,10 +279,11 @@ if __name__ == "__main__":
         task = progress.add_task(
             "Training", total=total_steps,
             train_loss="--.----", val_loss="--.----", lr="--.------",
-            tok_s="------",
+            tok_s="------", ends_at="--:--",
         )
 
         step_start_time = time.perf_counter()
+        start_wall_time = time.time()
         tokens_per_step = MICRO_BATCH * GRAD_ACCUM * BLOCK_SIZE
 
         for step in range(start_step + 1, MAX_ITERS + 1):
@@ -311,10 +313,19 @@ if __name__ == "__main__":
             step_start_time = now
             tok_s = tokens_per_step / elapsed if elapsed > 0 else 0
 
+            completed = step - start_step
+            remaining_steps = total_steps - completed
+            if completed > 0:
+                elapsed_wall = time.time() - start_wall_time
+                eta_seconds = (elapsed_wall / completed) * remaining_steps
+                ends = time.strftime("%H:%M", time.localtime(time.time() + eta_seconds))
+            else:
+                ends = "--:--"
+
             progress.update(
                 task, advance=1,
                 train_loss=f"{accum_loss:.4f}", lr=f"{lr:.6f}",
-                tok_s=f"{tok_s:,.0f}",
+                tok_s=f"{tok_s:,.0f}", ends_at=ends,
             )
 
             if step % EVAL_EVERY == 0 or step == 1:
@@ -326,6 +337,7 @@ if __name__ == "__main__":
                     val_loss=f"{losses['val_loss']:.4f}",
                     lr=f"{lr:.6f}",
                     tok_s=f"{tok_s:,.0f}",
+                    ends_at=ends,
                 )
                 progress.console.print(
                     f"  [bold]Step {step:>5}[/]  │  "
