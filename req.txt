@@ -1,0 +1,6 @@
+torch
+tiktoken
+numpy
+rich
+datasets
+tqdm
