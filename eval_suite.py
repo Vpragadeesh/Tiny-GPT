@@ -6,9 +6,10 @@ Tracks loss, perplexity, token accuracy, and generation diversity.
 import torch
 import tiktoken
 from tinygpt.training.evaluation import estimate_loss
+from tinygpt.device import resolve_device
 
 
-def eval_suite(model, get_batch, eval_iters=100, device="cuda", verbose=False):
+def eval_suite(model, get_batch, eval_iters=100, device=None, verbose=False):
     """Run comprehensive evaluation and return metrics dict.
 
     Args:
@@ -22,6 +23,7 @@ def eval_suite(model, get_batch, eval_iters=100, device="cuda", verbose=False):
         dict with keys: train_loss, val_loss, train_ppl, val_ppl,
                         token_accuracy, generation_sample, diversity_ratio
     """
+    device = device or resolve_device()
     enc = tiktoken.get_encoding("gpt2")
 
     # -- Loss / Perplexity --

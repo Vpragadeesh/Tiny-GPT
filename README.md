@@ -45,6 +45,27 @@ python chat.py  # interactive chat (fine-tuned model)
 bash train_deepspeed.sh
 ```
 
+## CPU-Only Training (7.9 GB RAM / 2 Cores)
+
+The entire pipeline supports fully deterministic, CPU-only execution while staying strictly under a 7.9 GB RAM budget. To force CPU training or inference, use:
+
+```bash
+TINYGPT_DEVICE=cpu python main.py
+```
+
+**Memory Breakdown (Peak RSS: ~2.5 GB)**
+- Model Weights (FP32): ~500 MB
+- Optimizer States (AdamW): ~1.0 GB
+- Gradients (FP32): ~500 MB
+- Python/Torch overhead: ~500 MB
+
+*Note*: CPU execution processes ~149 tokens/second on 2 cores. At an effective batch size of 64 (32,768 tokens per step), reaching 50,000 steps will take approximately 127 days. You can safely stop and resume using the robust checkpointing system.
+
+**Verification Command (Linux):**
+```bash
+systemd-run --user --scope -p MemoryMax=7.9G -p MemorySwapMax=0 -- TINYGPT_DEVICE=cpu python main.py
+```
+
 ## Memory Optimization
 
 The CPUOffloadAdamW optimizer keeps fp32 master weights + momentum/variance on CPU RAM to fit on 4GB VRAM:
@@ -99,7 +120,7 @@ pip install huggingface_hub    # Upload/download checkpoints
 ## Known Issues
 
 - **Weight tying**: `head.weight` is tied to `tok_emb.weight`. Checkpoints from older training runs with separate `head.weight` are handled in `load_checkpoint()`.
-- **Checkpoint key**: Unified to `model_state` across all training scripts.
+- **Checkpoint format conversion**: GPU checkpoints (using `CPUOffloadAdamW` state) and CPU checkpoints (using PyTorch `AdamW` state) have structurally different optimizer dictionaries. `load_checkpoint()` seamlessly converts them, but custom loading scripts must use the `convert_optimizer_state()` helper.
 - **chat.py**: Requires a fine-tuned checkpoint. Falls back to pre-trained if not available. Checkpoint dimension mismatches may occur with different model configs.
 
 ## License

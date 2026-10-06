@@ -38,3 +38,15 @@
 | Data quality filtering | None | Low-diversity skip + stats |
 | Unit tests | None | 4 tests |
 | README accuracy | MoE 0.5B (wrong) | Dense 124M (correct) |
+
+## Phase 6: CPU-Only / Low-Memory Adaptation (8GB RAM / 2 Cores)
+- [x] **Device & Precision Abstraction (`tinygpt/device.py`)**: Added `resolve_device()` and `autocast_ctx()`. Respects `TINYGPT_DEVICE` env var and dynamically toggles FP32 for CPU and BF16 for CUDA.
+- [x] **Optimizer Unification (`tinygpt/training/optimizer.py`)**: Implemented `make_optimizer` and `OptimizerWrap`. Removes redundant model-weight copies for CPU runs (saving ~500MB) while keeping the same interface. 
+- [x] **Checkpoint Safety (`tinygpt/training/checkpoint.py`)**: 
+  - Added atomic writes (`os.replace`) to prevent checkpoint corruption during OOMs.
+  - Developed `convert_optimizer_state()` for seamless loading of CUDA checkpoints on CPU and vice-versa.
+  - Implemented `load_model_weights()` helper to bypass optimizer deserialization when only model weights are needed (e.g. inference).
+- [x] **Peak Memory Control (`main.py`, `run.py`, `chat.py`)**: 
+  - Eradicated massive memory spikes by removing duplicate NaN-guard loads in `main.py`.
+  - Enforced explicitly garbage-collecting `ckpt["optimizer"]` in `run.py` immediately after extraction.
+  - Suppressed all import-time allocations across the codebase. `main.py` dataset memory-maps are now lazy, and instantiation is blocked behind `if __name__ == "__main__"`.

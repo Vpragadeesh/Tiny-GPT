@@ -5,41 +5,43 @@ import contextlib
 import torch
 import torch.nn.functional as F
 import tiktoken
+from tinygpt.device import autocast_ctx
+from tinygpt.training.checkpoint import load_model_weights
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SILENCE STATIC PRINTS FROM MAIN.PY IMPORT
-# ═════════════════════════════════════════════════════════════════════════════
+from model import TinyGPT, CausalSelfAttention
+from tinygpt.device import resolve_device, resolve_dtype
 
-with contextlib.redirect_stdout(io.StringIO()):
-    from main import TinyGPT, CausalSelfAttention, BLOCK_SIZE, DEVICE, DTYPE, vocab_size
+DEVICE = resolve_device()
+DTYPE = resolve_dtype(DEVICE)
+BLOCK_SIZE = 512
+vocab_size = 50257
 
 # ═════════════════════════════════════════════════════════════════════════════
 # LOAD MODEL & CHECKPOINT
 # ═════════════════════════════════════════════════════════════════════════════
 
-model = TinyGPT(
-    vocab_size=50257, block_size=512, embed_dim=768,
-    num_heads=12, num_layers=12, ffn_dim=3072, dropout=0.1,
-    attention_cls=CausalSelfAttention, use_manual_attention=False
-).to(dtype=DTYPE, device=DEVICE)
+def build_chat_model():
+    model = TinyGPT(
+        vocab_size=50257, block_size=512, embed_dim=768,
+        num_heads=12, num_layers=12, ffn_dim=3072, dropout=0.1,
+        attention_cls=CausalSelfAttention, use_manual_attention=False
+    ).to(dtype=DTYPE, device=DEVICE)
 
-# Resolve checkpoint path — prefer fine-tuned, fallback to pre-trained
-ckpt_path = os.path.join("checkpoints", "finetune_best.pt")
-if not os.path.exists(ckpt_path):
-    ckpt_path = os.path.join("checkpoints", "best.pt")
-if not os.path.exists(ckpt_path):
-    ckpt_path = os.path.join("checkpoints", "latest.pt")
+    # Resolve checkpoint path — prefer fine-tuned, fallback to pre-trained
+    ckpt_path = os.path.join("checkpoints", "finetune_best.pt")
+    if not os.path.exists(ckpt_path):
+        ckpt_path = os.path.join("checkpoints", "best.pt")
+    if not os.path.exists(ckpt_path):
+        ckpt_path = os.path.join("checkpoints", "latest.pt")
 
-if os.path.exists(ckpt_path):
-    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-    state = ckpt.get("model", ckpt.get("model_state", None))
-    if state is not None:
-        model.load_state_dict(state)
-    print(f"Loaded checkpoint: {ckpt_path}")
-else:
-    print("No checkpoint found — using random weights")
+    if os.path.exists(ckpt_path):
+        step, _, _ = load_model_weights(ckpt_path, model)
+        print(f"Loaded checkpoint: {ckpt_path} (step {step})")
+    else:
+        print("No checkpoint found — using random weights")
 
-model.eval()
+    model.eval()
+    return model
 
 enc = tiktoken.get_encoding("gpt2")
 EOT = enc.eot_token
@@ -51,6 +53,8 @@ EOT = enc.eot_token
 if __name__ == "__main__":
     print("Alpaca Assistant ready! Type 'quit' to exit.")
     print("-" * 50)
+
+    model = build_chat_model()
 
     # Initialize with the Alpaca System Prompt
     SYSTEM_PROMPT = "System: You are a helpful assistant.\n"
@@ -80,7 +84,7 @@ if __name__ == "__main__":
         with torch.no_grad():
             for _ in range(100):
                 ctx = ids[:, -BLOCK_SIZE:]
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(DTYPE == torch.bfloat16)):
+                with autocast_ctx(DEVICE, DTYPE):
                     logits, _ = model(ctx)
 
                 # Standard Assistant Sampling Parameters

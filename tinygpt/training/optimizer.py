@@ -74,3 +74,19 @@ class CPUOffloadAdamW:
         self.v = sd["v"]
         for gp, mp in zip(self.gpu_params, self.master):
             gp.data.copy_(mp.data)
+
+class OptimizerWrap:
+    def __init__(self, o): self.opt = o
+    def step(self):       self.opt.step()
+    def zero_grad(self):  self.opt.zero_grad(set_to_none=True)
+    def set_lr(self, lr):
+        for pg in self.opt.param_groups: pg["lr"] = lr
+    def state_dict(self):       return self.opt.state_dict()
+    def load_state_dict(self, sd): self.opt.load_state_dict(sd)
+
+def make_optimizer(model, lr, device):
+    if device == "cuda":
+        return CPUOffloadAdamW(model.parameters(), lr=lr)
+    else:
+        inner = torch.optim.AdamW(model.parameters(), lr=lr)
+        return OptimizerWrap(inner)

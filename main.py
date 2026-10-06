@@ -38,7 +38,8 @@ from rich.table import Table
 from rich import print as rprint
 from model import CausalSelfAttention, FeedForward, TransformerBlock, TinyGPT
 from tinygpt.attention import LinearAttention
-from tinygpt.training import CPUOffloadAdamW, get_lr, save_checkpoint, load_checkpoint, estimate_loss
+from tinygpt.training import CPUOffloadAdamW, make_optimizer, get_lr, save_checkpoint, load_checkpoint, estimate_loss
+from tinygpt.device import resolve_device, resolve_dtype, autocast_ctx
 from eval_suite import eval_suite
 
 console = Console()
@@ -48,23 +49,30 @@ console = Console()
 # ═════════════════════════════════════════════════════════════════════════════
 
 DATA_DIR = "data"
-for split in ("train", "val", "test"):
-    path = os.path.join(DATA_DIR, f"{split}.bin")
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"\n[ERROR] '{path}' not found.\n"
-            "Run  python prepare_data.py  first."
-        )
+train_data, val_data, test_data = None, None, None
 
-train_data = np.memmap(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16, mode="r")
-val_data   = np.memmap(os.path.join(DATA_DIR, "val.bin"),   dtype=np.uint16, mode="r")
-test_data  = np.memmap(os.path.join(DATA_DIR, "test.bin"),  dtype=np.uint16, mode="r")
+def _load_datasets():
+    global train_data, val_data, test_data
+    if train_data is not None:
+        return
+        
+    for split in ("train", "val", "test"):
+        path = os.path.join(DATA_DIR, f"{split}.bin")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"\n[ERROR] '{path}' not found.\n"
+                "Run  python prepare_data.py  first."
+            )
 
-print("Dataset loaded (memory-mapped)")
-print(f"  Train : {len(train_data):>12,} tokens")
-print(f"  Val   : {len(val_data):>12,} tokens")
-print(f"  Test  : {len(test_data):>12,} tokens")
-print()
+    train_data = np.memmap(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16, mode="r")
+    val_data   = np.memmap(os.path.join(DATA_DIR, "val.bin"),   dtype=np.uint16, mode="r")
+    test_data  = np.memmap(os.path.join(DATA_DIR, "test.bin"),  dtype=np.uint16, mode="r")
+
+    print("Dataset loaded (memory-mapped)")
+    print(f"  Train : {len(train_data):>12,} tokens")
+    print(f"  Val   : {len(val_data):>12,} tokens")
+    print(f"  Test  : {len(test_data):>12,} tokens")
+    print()
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 2. TOKENISER – GPT-2 BPE  (matches prepare_data.py)
@@ -97,7 +105,7 @@ FFN_DIM       = EMBED_DIM * 4   # 3 072
 DROPOUT       = 0.1
 LR            = 1.5e-4           # peak learning rate
 WARMUP_STEPS  = 500              # linear warmup for stability
-MAX_ITERS     = 50_000          # marathon training
+MAX_ITERS     = 10          # marathon training
 EVAL_EVERY    = 500
 EVAL_ITERS    = 50
 USE_ACTIVATION_CHECKPOINT = True  # required for 124M on 4GB VRAM
@@ -106,8 +114,8 @@ ATTENTION_TYPE = "softmax"       # "softmax" (default) or "linear"
 CHECKPOINT_DIR = "checkpoints"   # directory for saving checkpoints
 EFFECTIVE_BATCH = MICRO_BATCH * GRAD_ACCUM  # eff. batch size (64)
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE  = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+DEVICE = resolve_device()
+DTYPE  = resolve_dtype(DEVICE)
 # bfloat16: same exponent range as fp32 — no overflow/NaN, no GradScaler needed.
 # float16 caused NaN because it overflows at 65504.
 
@@ -122,6 +130,7 @@ print()
 # ═════════════════════════════════════════════════════════════════════════════
 
 def get_batch(split="train"):
+    _load_datasets()
     data = {"train": train_data, "val": val_data, "test": test_data}[split]
     ix = np.random.randint(0, len(data) - BLOCK_SIZE, size=(MICRO_BATCH,))
     x = np.stack([data[i   : i + BLOCK_SIZE    ].astype(np.int64) for i in ix])
@@ -166,87 +175,69 @@ def generate(model, prompt: str, max_new_tokens=200, temperature=0.8, top_k=50, 
 # 6. OPTIMIZER / SCHEDULER / CHECKPOINT — see tinygpt.training
 # ═════════════════════════════════════════════════════════════════════════════
 
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+def build_training_ctx():
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# 10. INSTANTIATE MODEL + OPTIMIZER
-# ═════════════════════════════════════════════════════════════════════════════
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
 
-if DEVICE == "cuda":
-    torch.cuda.empty_cache()
+    _attn_cls = LinearAttention if ATTENTION_TYPE == "linear" else None
+    model = TinyGPT(vocab_size, BLOCK_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS,
+                    FFN_DIM, DROPOUT, attention_cls=_attn_cls)
+    n_total  = sum(p.numel() for p in model.parameters())
+    n_active = n_total
 
-# ── Delete any NaN-poisoned checkpoints before loading ──
-_nan_guard = os.path.join(CHECKPOINT_DIR, "latest.pt")
-if os.path.exists(_nan_guard):
-    try:
-        _c = torch.load(_nan_guard, map_location="cpu", weights_only=False)
-        if _c.get("val_loss") != _c.get("val_loss"):  # nan != nan
-            os.remove(_nan_guard)
-            _best = os.path.join(CHECKPOINT_DIR, "best.pt")
-            if os.path.exists(_best):
-                os.remove(_best)
-            print("[yellow]NaN checkpoint detected and removed — starting fresh.[/yellow]")
-    except Exception:
-        pass
-
-_attn_cls = LinearAttention if ATTENTION_TYPE == "linear" else None
-model = TinyGPT(vocab_size, BLOCK_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS,
-                FFN_DIM, DROPOUT, attention_cls=_attn_cls)
-n_total  = sum(p.numel() for p in model.parameters())
-n_active = n_total  # In a dense model, all parameters are active
-
-# Move to GPU in fp16  (or stay fp32 on CPU)
-model = model.to(dtype=DTYPE, device=DEVICE)
-gc.collect()
-if DEVICE == "cuda":
-    torch.cuda.empty_cache()
-    vram_used = torch.cuda.memory_allocated() / 1024**3
-    print(f"GPU VRAM used   : {vram_used:.2f} GiB  (model weights)")
-
-if DEVICE == "cuda":
-    # Initialize optimizer AFTER config changes so it uses the new LR
-    optimizer = CPUOffloadAdamW(model.parameters(), lr=LR)
+    model = model.to(dtype=DTYPE, device=DEVICE)
+    
+    if os.environ.get("TINYGPT_COMPILE") == "1":
+        print("Compiling model...")
+        try:
+            model = torch.compile(model, mode="default")
+        except Exception as e:
+            print(f"[warn] Failed to compile model: {e}")
+            
     gc.collect()
-    opt_gb = n_total * 4 * 3 / 1024**3   # fp32 master + fp32 m + fp32 v
-    print(f"CPU RAM for opt : ~{opt_gb:.1f} GiB  (fp32 master + fp32 m + fp32 v)")
-else:
-    _inner = torch.optim.AdamW(model.parameters(), lr=LR)
-    class _Wrap:
-        def __init__(self, o): self.opt = o
-        def step(self):       self.opt.step()
-        def zero_grad(self):  self.opt.zero_grad(set_to_none=True)
-        def set_lr(self, lr):
-            for pg in self.opt.param_groups: pg["lr"] = lr
-        def state_dict(self):       return self.opt.state_dict()
-        def load_state_dict(self, sd): self.opt.load_state_dict(sd)
-    optimizer = _Wrap(_inner)
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+        vram_used = torch.cuda.memory_allocated() / 1024**3
+        print(f"GPU VRAM used   : {vram_used:.2f} GiB  (model weights)")
 
-print(f"Total  parameters : {n_total:>14,}")
-print(f"Active per token  : {n_active:>14,}")
-print()
+    optimizer = make_optimizer(model, lr=LR, device=DEVICE)
+    gc.collect()
+    if DEVICE == "cuda":
+        opt_gb = n_total * 4 * 3 / 1024**3
+        print(f"CPU RAM for opt : ~{opt_gb:.1f} GiB  (fp32 master + fp32 m + fp32 v)")
 
-# ── Auto-resume from latest checkpoint ──
-RESUME = True  # Automatically resume from latest.pt if it exists
-start_step = 0
-best_val   = float("inf")
-latest_ckpt = os.path.join(CHECKPOINT_DIR, "latest.pt")
-if RESUME and os.path.exists(latest_ckpt):
-    try:
-        _c = torch.load(latest_ckpt, map_location="cpu", weights_only=False)
-        # Skip NaN-poisoned checkpoints
-        if _c.get("val_loss") != _c.get("val_loss") or _c.get("train_loss") != _c.get("train_loss"):
-            print("Checkpoint has NaN losses — deleting and starting fresh")
-            os.remove(latest_ckpt)
-        else:
+    print(f"Total  parameters : {n_total:>14,}")
+    print(f"Active per token  : {n_active:>14,}")
+    print()
+
+    RESUME = True
+    start_step = 0
+    best_val   = float("inf")
+    latest_ckpt = os.path.join(CHECKPOINT_DIR, "latest.pt")
+    if RESUME and os.path.exists(latest_ckpt):
+        try:
             print("Checkpoint found — resuming …")
             start_step, best_val = load_checkpoint(latest_ckpt, model, optimizer, attention_type=ATTENTION_TYPE)
             print()
-    except Exception as e:
-        print(f"Checkpoint corrupted ({e}) — starting fresh")
-else:
-    if RESUME:
-        print("No checkpoint found — starting fresh training")
-    print()
+        except ValueError as e:
+            if "NaN" in str(e):
+                print("[yellow]NaN checkpoint detected and removed — starting fresh.[/yellow]")
+                os.remove(latest_ckpt)
+                _best = os.path.join(CHECKPOINT_DIR, "best.pt")
+                if os.path.exists(_best):
+                    os.remove(_best)
+            else:
+                print(f"Checkpoint corrupted ({e}) — starting fresh")
+        except Exception as e:
+            print(f"Checkpoint corrupted ({e}) — starting fresh")
+    else:
+        if RESUME:
+            print("No checkpoint found — starting fresh training")
+        print()
+        
+    return model, optimizer, start_step, best_val
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 11. TRAINING LOOP
@@ -255,6 +246,8 @@ else:
 if __name__ == "__main__":
     console.rule("[bold green]Training started")
     print()
+    
+    model, optimizer, start_step, best_val = build_training_ctx()
 
     with Progress(
         SpinnerColumn(),
@@ -296,8 +289,7 @@ if __name__ == "__main__":
 
             for _ in range(GRAD_ACCUM):
                 x, y = get_batch("train")
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                        enabled=(DTYPE == torch.bfloat16)):
+                with autocast_ctx(DEVICE, DTYPE):
                     _, loss = model(x, y, use_activation_checkpoint=USE_ACTIVATION_CHECKPOINT)
                 (loss / GRAD_ACCUM).backward()
                 accum_loss += loss.item() / GRAD_ACCUM

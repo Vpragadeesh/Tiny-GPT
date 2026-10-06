@@ -21,7 +21,9 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 import tiktoken
 from model import CausalSelfAttention, FeedForward, TransformerBlock, TinyGPT
-from tinygpt.training import CPUOffloadAdamW, get_lr, save_checkpoint, estimate_loss
+from tinygpt.training import CPUOffloadAdamW, make_optimizer, get_lr, save_checkpoint, estimate_loss
+from tinygpt.training.checkpoint import load_model_weights
+from tinygpt.device import resolve_device, resolve_dtype, autocast_ctx
 from eval_suite import eval_suite
 from rich.progress import (
     Progress, BarColumn, TextColumn, TimeRemainingColumn, TimeElapsedColumn,
@@ -95,8 +97,8 @@ if __name__ == "__main__":
     CHECKPOINT_DIR = "checkpoints"
     PRETRAINED_CKPT = os.path.join(CHECKPOINT_DIR, "best.pt")
 
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    DTYPE  = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+    DEVICE = resolve_device()
+    DTYPE  = resolve_dtype(DEVICE)
 
     print(f"Device          : {DEVICE.upper()}")
     print(f"Precision       : {'BF16' if DTYPE == torch.bfloat16 else 'FP32'}")
@@ -137,6 +139,14 @@ if __name__ == "__main__":
     n_total = sum(p.numel() for p in model.parameters())
 
     model = model.to(dtype=DTYPE, device=DEVICE)
+    
+    if os.environ.get("TINYGPT_COMPILE") == "1":
+        print("Compiling model...")
+        try:
+            model = torch.compile(model, mode="default")
+        except Exception as e:
+            print(f"[warn] Failed to compile model: {e}")
+            
     gc.collect()
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
@@ -149,26 +159,13 @@ if __name__ == "__main__":
         )
 
     print(f"Loading pre-trained checkpoint: {PRETRAINED_CKPT}")
-    ckpt = torch.load(PRETRAINED_CKPT, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model_state"])
-    print(f"  Loaded from step {ckpt['step']}  "
-          f"(train {ckpt['train_loss']:.4f}, val {ckpt['val_loss']:.4f})")
+    step, train_loss, val_loss = load_model_weights(PRETRAINED_CKPT, model)
+    print(f"  Loaded from step {step}  "
+          f"(train {train_loss:.4f}, val {val_loss:.4f})")
     print()
 
     # Initialize optimizer
-    if DEVICE == "cuda":
-        optimizer = CPUOffloadAdamW(model.parameters(), lr=LR)
-    else:
-        _inner = torch.optim.AdamW(model.parameters(), lr=LR)
-        class _Wrap:
-            def __init__(self, o): self.opt = o
-            def step(self):       self.opt.step()
-            def zero_grad(self):  self.opt.zero_grad(set_to_none=True)
-            def set_lr(self, lr):
-                for pg in self.opt.param_groups: pg["lr"] = lr
-            def state_dict(self):       return self.opt.state_dict()
-            def load_state_dict(self, sd): self.opt.load_state_dict(sd)
-        optimizer = _Wrap(_inner)
+    optimizer = make_optimizer(model, lr=LR, device=DEVICE)
 
     print(f"Total  parameters : {n_total:>14,}")
     print()
@@ -221,8 +218,7 @@ if __name__ == "__main__":
 
             for _ in range(GRAD_ACCUM):
                 x, y = get_batch("train")
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                        enabled=(DTYPE == torch.bfloat16)):
+                with autocast_ctx(DEVICE, DTYPE):
                     _, loss = model(x, y)
                 (loss / GRAD_ACCUM).backward()
                 accum_loss += loss.item() / GRAD_ACCUM

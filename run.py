@@ -14,6 +14,7 @@ No training — just inference from the best checkpoint.
 import os
 import sys
 import argparse
+import gc
 from pathlib import Path
 
 import torch
@@ -22,6 +23,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 import tiktoken
 from model import CausalSelfAttention, FeedForward, TransformerBlock, TinyGPT
+from tinygpt.device import resolve_device, resolve_dtype, autocast_ctx
 
 # ═════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION (must match main.py)
@@ -35,8 +37,8 @@ FFN_DIM = EMBED_DIM * 4
 DROPOUT = 0.0
 CHECKPOINT_DIR = "checkpoints"
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+DEVICE = resolve_device()
+DTYPE = resolve_dtype(DEVICE)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. TOKENISER – GPT-2 BPE
@@ -146,9 +148,7 @@ def generate(model, prompt: str, max_new_tokens=200, temperature=0.8,
 
     for _ in range(max_new_tokens):
         ctx = ids[:, -BLOCK_SIZE:]
-        with torch.amp.autocast(
-            "cuda", dtype=torch.bfloat16, enabled=(DTYPE == torch.bfloat16)
-        ):
+        with autocast_ctx(DEVICE, DTYPE):
             logits, _ = model(ctx)
         logits = logits[:, -1, :].float() / temperature
 
@@ -199,14 +199,29 @@ def load_model(
         sys.exit(1)
 
     print(f"Loading model from {checkpoint_path} ...", end=" ", flush=True)
-    ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
+    try:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
+    except TypeError:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    
     model_state = _get_model_state_from_checkpoint(ckpt)
+    
+    # Drop optimizer state to free up memory before building model
+    if "optimizer" in ckpt:
+        del ckpt["optimizer"]
+    del ckpt
+    gc.collect()
+    
     apply_model_config_from_state_dict(model_state)
 
     model = TinyGPT(vocab_size, BLOCK_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS,
                     FFN_DIM, DROPOUT, use_manual_attention=True)
     model = model.to(dtype=DTYPE, device=DEVICE)
     model.load_state_dict(model_state, strict=False)
+    
+    del model_state
+    gc.collect()
+    
     model.eval()
 
     print("✓")
