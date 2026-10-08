@@ -23,10 +23,9 @@ vocab_size = 50257
 def build_chat_model():
     model = TinyGPT(
         vocab_size=50257, block_size=512, embed_dim=768,
-        num_heads=12, num_layers=12, ffn_dim=3072, dropout=0.1,
+        num_heads=12, num_layers=10, ffn_dim=3072, dropout=0.1,
         attention_cls=CausalSelfAttention, use_manual_attention=False
     ).to(dtype=DTYPE, device=DEVICE)
-
     # Resolve checkpoint path — prefer fine-tuned, fallback to pre-trained
     ckpt_path = os.path.join("checkpoints", "finetune_best.pt")
     if not os.path.exists(ckpt_path):

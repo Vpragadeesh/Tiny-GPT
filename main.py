@@ -91,24 +91,24 @@ print(f"Tokeniser : GPT-2 BPE  (vocab {vocab_size:,})")
 print()
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 3. HYPERPARAMETERS
-# ═════════════════════════════════════════════════════════════════════════════
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. HYPERPARAMETERS — 95M config for CPU (2c/8GB): 10L×768d×12H, batch 64
+# ══════════════════════════════════════════════════════════════════════════════
 BLOCK_SIZE    = 512              # context window (tokens)
-MICRO_BATCH   = 4                # samples per GPU forward pass (VRAM-limited to 4GB)
+MICRO_BATCH   = 4                # samples per forward pass (matches original)
 GRAD_ACCUM    = 16               # gradient accumulation steps → eff. batch 64
                                  # Total tokens/step: MICRO_BATCH * GRAD_ACCUM * BLOCK_SIZE
-EMBED_DIM     = 768              # model width (~124M params)
+EMBED_DIM     = 768              # model width
 NUM_HEADS     = 12               # attention heads (768 / 12 = 64 head_dim)
-NUM_LAYERS    = 12               # transformer blocks
+NUM_LAYERS    = 10               # transformer blocks (~95M params)
 FFN_DIM       = EMBED_DIM * 4   # 3 072
 DROPOUT       = 0.1
-LR            = 1.5e-4           # peak learning rate
+LR            = 2.5e-4           # peak learning rate (higher for fewer layers)
 WARMUP_STEPS  = 500              # linear warmup for stability
-MAX_ITERS     = 10          # marathon training
+MAX_ITERS     = 50_000           # marathon training
 EVAL_EVERY    = 500
 EVAL_ITERS    = 50
-USE_ACTIVATION_CHECKPOINT = True  # required for 124M on 4GB VRAM
+USE_ACTIVATION_CHECKPOINT = True  # saves activation memory
 GRAD_CLIP     = 1.0
 ATTENTION_TYPE = "softmax"       # "softmax" (default) or "linear"
 CHECKPOINT_DIR = "checkpoints"   # directory for saving checkpoints

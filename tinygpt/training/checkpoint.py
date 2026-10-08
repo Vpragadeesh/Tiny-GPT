@@ -74,6 +74,10 @@ def load_model_weights(path, model, attention_type=None):
         
     sd = ckpt["model_state"]
 
+    # Filter out layers that don't exist in current model (handles layer count changes)
+    model_keys = set(model.state_dict().keys())
+    sd = {k: v for k, v in sd.items() if k in model_keys}
+
     if attention_type is not None:
         ckpt_attn = ckpt.get("attention_type", "softmax")
         if ckpt_attn != attention_type:
@@ -82,7 +86,7 @@ def load_model_weights(path, model, attention_type=None):
             sd = {k: v for k, v in sd.items() if ".attn." not in k}
         model.load_state_dict(sd, strict=(ckpt_attn == attention_type))
     else:
-        model.load_state_dict(sd)
+        model.load_state_dict(sd, strict=False)
         
     step = ckpt.get('step', 0)
     train_loss = ckpt.get('train_loss', 0.0)

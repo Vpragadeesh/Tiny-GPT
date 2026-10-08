@@ -26,13 +26,13 @@ from model import CausalSelfAttention, FeedForward, TransformerBlock, TinyGPT
 from tinygpt.device import resolve_device, resolve_dtype, autocast_ctx
 
 # ═════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION (must match main.py)
 # ═════════════════════════════════════════════════════════════════════════════
-
+# CONFIGURATION (must match main.py) — 95M config
+# ════════════════════════════════════════════════════════════════════════════
 BLOCK_SIZE = 512
 EMBED_DIM = 768
 NUM_HEADS = 12
-NUM_LAYERS = 12
+NUM_LAYERS = 10
 FFN_DIM = EMBED_DIM * 4
 DROPOUT = 0.0
 CHECKPOINT_DIR = "checkpoints"
@@ -212,7 +212,10 @@ def load_model(
     del ckpt
     gc.collect()
     
-    apply_model_config_from_state_dict(model_state)
+    # Use fixed 10-layer config (95M) instead of inferring from checkpoint
+    global NUM_LAYERS
+    NUM_LAYERS = 10
+    # Skip apply_model_config_from_state_dict to preserve fixed config
 
     model = TinyGPT(vocab_size, BLOCK_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS,
                     FFN_DIM, DROPOUT, use_manual_attention=True)

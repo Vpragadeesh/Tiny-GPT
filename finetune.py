@@ -74,24 +74,24 @@ if __name__ == "__main__":
     print()
 
     # ═════════════════════════════════════════════════════════════════════════════
-    # 3. HYPERPARAMETERS (tuned for fine-tuning)
-    # ═════════════════════════════════════════════════════════════════════════════
-
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # 3. HYPERPARAMETERS (tuned for fine-tuning, 95M config)
+    # ═══════════════════════════════════════════════════════════════════════════════
     BLOCK_SIZE    = 512              # context window (tokens) — must match pre-trained
-    MICRO_BATCH   = 4                # samples per GPU forward pass
+    MICRO_BATCH   = 4                # samples per forward pass
     GRAD_ACCUM    = 16               # accumulate before optimizer step → eff. batch 64
-    EMBED_DIM     = 768              # model width (must match pre-trained 124M)
+    EMBED_DIM     = 768              # model width (must match pre-trained 95M)
     NUM_HEADS     = 12               # attention heads
-    NUM_LAYERS    = 12               # transformer blocks
+    NUM_LAYERS    = 10               # transformer blocks
     FFN_DIM       = EMBED_DIM * 4   # 3072
     DROPOUT       = 0.1
     LR            = 2e-5             # LOW learning rate — preserve pre-trained weights
-                                     # (10x lower than pre-training LR=1.5e-4)
+                                      # (10x lower than pre-training LR=2.5e-4)
     WARMUP_STEPS  = 500
     MAX_ITERS     = 10_000           # instruction tuning steps
     EVAL_EVERY    = 1_000
     EVAL_ITERS    = 50
-    USE_ACTIVATION_CHECKPOINT = True  # required for 124M on 4GB VRAM
+    USE_ACTIVATION_CHECKPOINT = True  # saves activation memory
     GRAD_CLIP     = 1.0
     EFFECTIVE_BATCH = MICRO_BATCH * GRAD_ACCUM
     CHECKPOINT_DIR = "checkpoints"
